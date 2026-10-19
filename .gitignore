@@ -1,0 +1,86 @@
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ==============================
+# Jupyter Notebook
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# IDE and operating system
+# ==============================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Secrets and environment files
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+*.tmp
+*.temp
+~$*
+
+# ==============================
+# Source data archives
+# Keep Source_Data directory structure,
+# but do not track experiment ZIP files.
+# ==============================
+Source_Data/*.zip
+Source_Data/*.ZIP
+/*.zip
+/*.ZIP
+
+# Ignore all results files, but keep the directory
+App/results/*
+!App/results/.gitkeep
+
+# ==============================
+# Intermediate CSV files
+# Ignore CSVs recursively while keeping
+# directories and non-CSV files.
+# ==============================
+Intermediate_csv/**/*.csv
+Intermediate_csv/**/*.CSV
+
+# Also cover CSVs directly inside
+# Intermediate_csv itself.
+Intermediate_csv/*.csv
+Intermediate_csv/*.CSV
+
+# ==============================
+# Generated model artifacts
+# ==============================
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.onnx
+
+# ==============================
+# OS-generated archives / backups
+# ==============================
+*.bak
