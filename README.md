@@ -159,7 +159,6 @@ Design notes:
 ├── run_episode.py                     entry point for unseen episodes
 ├── requirements.txt                   pinned environment (all results)
 ├── requirements-notebook-freeze.txt   teammate's original environment snapshot (reference)
-├── hackathon2_cross_room_few_shot_csi.md   challenge specification
 ├── App/
 │   ├── configs/experiment.yaml        every setting: paths, QC, windows, SSL, Task 3, final model
 │   ├── scripts/

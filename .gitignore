@@ -92,3 +92,6 @@ App/results/*
 # OS-generated archives / backups
 # ==============================
 *.bak
+
+# Local copy of the challenge specification (not part of the repository)
+hackathon2_cross_room_few_shot_csi.md
