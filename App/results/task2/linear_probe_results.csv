@@ -1,0 +1,4 @@
+representation,dim,probe_C,dev_cv_macro_f1,val_macro_f1,val_balanced_accuracy,val_macro_f1_room_A,val_macro_f1_room_B
+SSL encoder,256,1.0,0.9643,0.9732,0.9773,0.9509,0.9786
+Random-weight encoder,256,1.0,0.8357,0.8464,0.8511,0.8834,0.7974
+Handcrafted features,521,1.0,0.9751,0.9821,0.9857,0.9866,0.976

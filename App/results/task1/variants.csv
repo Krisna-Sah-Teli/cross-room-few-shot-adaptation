@@ -1,0 +1,7 @@
+variant,description,dev_cv_accuracy,dev_cv_accuracy_std,validation_accuracy,validation_balanced_accuracy,validation_errors,val_A_as_B,val_B_as_A,windows_kept_A,windows_kept_B
+shortcut,Shortcut: narrow-frame fraction only,0.9966265060240964,0.0019277108433735147,0.9961685823754789,0.9973333333333334,2,0.0,2.0,,
+full_window_z,"All 256 subcarriers, per-window z-score (teammate)",0.9997590361445784,0.0004819277108433883,1.0,1.0,0,0.0,0.0,,
+full_row_gain,"All 256 subcarriers, per-observation gain removed",0.9995180722891567,0.0009638554216867324,1.0,1.0,0,0.0,0.0,,
+matched80_M1,"First 1 full 80 MHz observations, 256 subcarriers, gain removed",0.9922815746900053,0.0016458328687601312,0.9961464354527938,0.9951944444444445,2,,,1063.0,3603.0
+matched80_M5,"First 5 full 80 MHz observations, 256 subcarriers, gain removed",1.0,0.0,1.0,1.0,0,,,1062.0,3603.0
+matched80_M30,"First 30 full 80 MHz observations, 256 subcarriers, gain removed",1.0,0.0,1.0,1.0,0,,,991.0,3603.0

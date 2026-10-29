@@ -1,0 +1,13 @@
+experiment,target_room,K,metric,value
+task2_SSL encoder,A+B,,val_macro_f1,0.9732
+task2_SSL encoder,A+B,,val_balanced_accuracy,0.9773
+task2_SSL encoder,A+B,,val_macro_f1_room_A,0.9509
+task2_SSL encoder,A+B,,val_macro_f1_room_B,0.9786
+task2_Random-weight encoder,A+B,,val_macro_f1,0.8464
+task2_Random-weight encoder,A+B,,val_balanced_accuracy,0.8511
+task2_Random-weight encoder,A+B,,val_macro_f1_room_A,0.8834
+task2_Random-weight encoder,A+B,,val_macro_f1_room_B,0.7974
+task2_Handcrafted features,A+B,,val_macro_f1,0.9821
+task2_Handcrafted features,A+B,,val_balanced_accuracy,0.9857
+task2_Handcrafted features,A+B,,val_macro_f1_room_A,0.9866
+task2_Handcrafted features,A+B,,val_macro_f1_room_B,0.976
