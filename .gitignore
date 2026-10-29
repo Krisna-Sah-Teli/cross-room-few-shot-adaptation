@@ -93,5 +93,6 @@ App/results/*
 # ==============================
 *.bak
 
-# Local copy of the challenge specification (not part of the repository)
+# Local copies of the challenge specification (not part of the repository)
 hackathon2_cross_room_few_shot_csi.md
+CS60055_Challenge2.pdf
