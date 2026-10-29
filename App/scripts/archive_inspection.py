@@ -2,8 +2,6 @@ from pathlib import Path
 from zipfile import ZipFile
 from collections import Counter
 import re
-import csv
-import io
 
 ROOM_A_CLASSES = {"fall", "sit", "sitdown", "stand", "standup", "walk"}
 ROOM_B_PREFIXES = {
