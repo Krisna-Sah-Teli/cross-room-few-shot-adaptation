@@ -15,7 +15,7 @@ All numbers are **validation** results on the fixed challenge validation sets (R
 | Input (all 256 subcarriers, 150-observation windows) | Validation accuracy |
 |---|---:|
 | Per-packet gain removed (headline, used as the router) | **100%** |
-| Per-window z-score (teammate's original setup) | 100% |
+| Per-window z-score (alternative normalization) | 100% |
 | Shortcut diagnostic: fraction of narrow 20 MHz packets only | 99.6% |
 | Control: only full 80 MHz packets, 1 / 5 / 30 per window | 99.6% / 100% / 100% |
 
@@ -158,7 +158,7 @@ Design notes:
 .
 ├── run_episode.py                     entry point for unseen episodes
 ├── requirements.txt                   pinned environment (all results)
-├── requirements-notebook-freeze.txt   teammate's original environment snapshot (reference)
+├── requirements-notebook-freeze.txt   full environment snapshot of the notebook machine (reference)
 ├── App/
 │   ├── configs/experiment.yaml        every setting: paths, QC, windows, SSL, Task 3, final model
 │   ├── scripts/
@@ -180,7 +180,7 @@ Design notes:
 │   │   └── archive_inspection.py, pcap_inspection.py, normalization.py, room_classifier.py,
 │   │       dataset_builder.py         used by the exploration notebook
 │   ├── tests/                         test_preprocessing.py, test_few_shot.py, test_room_structure.py, test_episode.py
-│   ├── main_notebook.ipynb            exploration record: file inspection, decoder audits, first Task 1
+│   ├── main_notebook.ipynb            exploration notebook: file inspection, decoder audits, first experiments
 │   └── results/
 │       ├── data/                      manifests, QC report, preprocessing settings (tensors not tracked)
 │       ├── task1/, task2/, task3/     metrics.csv, predictions, figures, trained router and encoder

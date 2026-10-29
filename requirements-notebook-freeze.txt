@@ -1,4 +1,4 @@
-# Original environment snapshot of the teammate's machine (pip freeze), kept for reference.
+# Full environment snapshot (pip freeze) of the machine used for the exploration notebook, kept for reference.
 # The pipeline itself uses requirements.txt, whose versions produced every reported result.
 anyio==4.15.1
 argon2-cffi==25.1.0

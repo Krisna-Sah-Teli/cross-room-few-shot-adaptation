@@ -14,7 +14,7 @@ from scripts.csi_quality import classify_band_coverage
 def normalize(X, method, eps=1e-6):
     """Normalize amplitude windows using only each window's own values (no fitted statistics).
 
-    window_zscore: log1p, then z-score over the whole window (the teammate's choice).
+    window_zscore: log1p, then z-score over the whole window.
     row_gain:      log1p, then subtract each observation's mean over its subcarriers.
                    This removes the per-packet gain/autoscaling factor, so only the
                    shape of the frequency response is left.

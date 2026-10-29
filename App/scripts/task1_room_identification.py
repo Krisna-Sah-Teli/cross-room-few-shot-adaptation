@@ -3,7 +3,7 @@
 Every variant uses all 256 subcarriers of the 150 x 256 window:
   shortcut          one feature: fraction of narrow (non-80 MHz) observations in the window.
                     Diagnostic only - shows how much a recording-setting difference explains.
-  full_window_z     log1p + per-window z-score (teammate's setup).
+  full_window_z     log1p + per-window z-score (alternative normalization).
   full_row_gain     log1p minus each observation's own mean, i.e. per-packet gain removed (headline).
 
 All models are fitted on development windows only. Development accuracy comes
@@ -38,7 +38,7 @@ from scripts.room_fingerprint import center_crop, narrow_band_fraction, normaliz
 
 VARIANTS = {
     "shortcut": dict(norm=None, title="Shortcut: narrow-frame fraction only"),
-    "full_window_z": dict(norm="window_zscore", title="All 256 subcarriers, per-window z-score (teammate)"),
+    "full_window_z": dict(norm="window_zscore", title="All 256 subcarriers, per-window z-score"),
     "full_row_gain": dict(norm="row_gain", title="All 256 subcarriers, per-observation gain removed"),
 }
 HEADLINE = "full_row_gain"
@@ -96,7 +96,7 @@ def plot_window_length(curve, out_path):
     ink, ink_muted, grid, surface = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
     styles = {
         "shortcut": dict(color="#8a8984", linestyle="--", marker="s", label="Shortcut (narrow-frame fraction)"),
-        "full_window_z": dict(color="#eb6834", linestyle="-", marker="o", label="Per-window z-score (teammate)"),
+        "full_window_z": dict(color="#eb6834", linestyle="-", marker="o", label="Per-window z-score"),
         "full_row_gain": dict(color="#2a78d6", linestyle="-", marker="o", label="Per-packet gain removed (headline)"),
     }
     fig, ax = plt.subplots(figsize=(7.5, 4.2), facecolor=surface)

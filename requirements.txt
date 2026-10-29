@@ -10,5 +10,5 @@ matplotlib==3.10.6
 PyYAML==6.0.3
 
 # Only needed to run the exploration notebook App/main_notebook.ipynb in VS Code / Jupyter.
-# (The teammate's original full environment snapshot is kept in requirements-notebook-freeze.txt.)
+# (A full environment snapshot of the notebook machine is kept in requirements-notebook-freeze.txt.)
 ipykernel==7.1.0
