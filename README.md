@@ -1,6 +1,6 @@
-# Cross-Room Few-Shot Adaptation
+# WiQ : Cross-Room Few-Shot Adaptation
 
-**Course:** CS60055 — Ubiquitous Computing  
+**Course:** CS60055 - Ubiquitous Computing  
 **Project:** Hackathon Challenge 2  
 **Topic:** Environment-aware, label-efficient activity recognition from WiFi Channel State Information (CSI)
 
@@ -210,9 +210,3 @@ Shared activities: SIT, STAND, WALK. Room-specific activities are learned from K
 - **Room B data:** consecutive observations behave like independent noisy samples (no temporal coherence, values capped at 2,047, origin of the export unknown), which limits cross-room transfer of shared activities.
 - **Room-structure prior:** it relies on two assumptions about the target room — walking is its only strongly fluctuating activity, and transition captures start and end in the stated postures. Both hold for Room A; the prior is not applicable to Room B. Its design was compared on the validation set, so its gain is a validation result.
 
-## Notes
-
-- `App/main_notebook.ipynb` is the teammate's exploration record. Its export cells write their own copies of the intermediate CSVs (names such as `sitting__Sitting_0.csv`) next to the pipeline's files; both contain identical values, and the pipeline only reads its own manifest paths.
-- The technical report, contribution statement and AI-use disclosure required by §14 are submitted separately.
-
-Prepared for the CS60055 Ubiquitous Computing Hackathon Challenge 2.
