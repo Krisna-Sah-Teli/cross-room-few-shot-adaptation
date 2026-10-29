@@ -53,25 +53,30 @@ Source_Data/*.ZIP
 /*.zip
 /*.ZIP
 
-# Ignore all results files, but keep the directory
+# ==============================
+# Derived data (all regenerated from Source_Data by App/scripts/build_dataset.py)
+# Folder names are matched exactly, as on case-sensitive systems (Linux, macOS).
+# ==============================
+Intermediate_CSV/
+Windows/
+Episodes/
+*.npy
+App/results/data/room_a_observations.csv
+
+# ==============================
+# Results: keep the pipeline's metrics, predictions, figures, manifests and
+# trained models; ignore the exploration notebook's own output files.
+# ==============================
 App/results/*
 !App/results/.gitkeep
+!App/results/data/
+!App/results/task1/
+!App/results/task2/
+!App/results/task3/
+!App/results/final_model/
 
 # ==============================
-# Intermediate CSV files
-# Ignore CSVs recursively while keeping
-# directories and non-CSV files.
-# ==============================
-Intermediate_csv/**/*.csv
-Intermediate_csv/**/*.CSV
-
-# Also cover CSVs directly inside
-# Intermediate_csv itself.
-Intermediate_csv/*.csv
-Intermediate_csv/*.CSV
-
-# ==============================
-# Generated model artifacts
+# Generated model artifacts (only the pipeline's trained models are kept)
 # ==============================
 *.pkl
 *.pickle
@@ -79,6 +84,9 @@ Intermediate_csv/*.CSV
 *.pt
 *.pth
 *.onnx
+!App/results/task1/room_router.pkl
+!App/results/task2/encoder.pt
+!App/results/final_model/bundle.pkl
 
 # ==============================
 # OS-generated archives / backups

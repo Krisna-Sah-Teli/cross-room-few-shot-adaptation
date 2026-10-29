@@ -42,11 +42,11 @@ def collect_room_b_captures(zip_path):
         captures[activity] = sorted(captures[activity], key=str.lower)
     return dict(captures), unmatched
 
-def create_room_b_split(zip_path, output_csv, validation_per_class=25, seed=42):
+def assign_room_b_split(zip_path, validation_per_class=25, seed=42):
     """
     Deterministically select validation captures from each class.
     Uses sorted ZIP member paths and a seeded random sampler.
-    Writes one row per original capture, before window generation.
+    Returns one row per original capture without writing anything.
     """
     captures, unmatched = collect_room_b_captures(zip_path)
     expected = set(ROOM_B_PREFIXES)
@@ -73,6 +73,16 @@ def create_room_b_split(zip_path, output_csv, validation_per_class=25, seed=42):
                 "activity": activity,
                 "split": "validation" if index in selected_indices else "development",
             })
+    return rows
+
+
+def create_room_b_split(zip_path, output_csv, validation_per_class=25, seed=42):
+    """
+    Create the fixed Room B split (see `assign_room_b_split`) and save it.
+    Writes one row per original capture, before window generation.
+    """
+    rows = assign_room_b_split(zip_path, validation_per_class, seed)
+    expected = set(ROOM_B_PREFIXES)
 
     output_csv = Path(output_csv)
     output_csv.parent.mkdir(parents=True, exist_ok=True)

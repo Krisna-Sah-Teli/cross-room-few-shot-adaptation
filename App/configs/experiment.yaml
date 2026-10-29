@@ -1,0 +1,101 @@
+# Pipeline configuration for the cross-room few-shot CSI benchmark.
+# Relative paths are resolved against the project root (the folder containing App/).
+
+paths:
+  room_a_zip: Source_Data/Experiment-2.zip
+  room_b_zip: Source_Data/Experiment-3.zip
+  intermediate_dir: Intermediate_CSV        # one CSV per capture, 256 amplitude columns
+  data_dir: App/results/data                # manifests, QC reports, window tensors
+  windows_dir: Windows                      # one window_XXXXX.npy (150 x 256 float32) per window
+  results_dir: App/results                  # experiment metrics and figures
+  final_model_dir: App/results/final_model  # trained system used by run_episode.py
+
+room_a:
+  udp_port: 5500
+  expected_subcarriers: 256
+  # Keep the complete packets that precede a truncated packet record instead of
+  # discarding the whole capture (affects sit109.pcap and sit144.pcap).
+  salvage_truncated: true
+
+room_b:
+  validation_per_class: 25
+  split_seed: 42
+
+quality:
+  # The 80 MHz channel is four 20 MHz subchannels. FFT-order index ranges
+  # [start, stop) of each subchannel's core, away from nulls and edges:
+  subchannels:
+    sub1: [134, 187]                        # subcarriers -122 ... -70 (lowest)
+    sub2: [196, 255]                        # subcarriers  -60 ...  -2
+    sub3: [2, 61]                           # subcarriers   +2 ... +60
+    sub4: [68, 123]                         # subcarriers  +68 ... +122 (highest)
+  # A subchannel is occupied when its mean amplitude exceeds this fraction
+  # of the strongest subchannel's mean in the same observation.
+  occupied_fraction: 0.1
+  # Strongest subchannel mean below this marks an observation as empty.
+  empty_amplitude: 1.0
+  drop_consecutive_duplicates: true
+
+# Every model uses the full 150 x 256 window (all 256 subcarriers).
+window:
+  length: 150
+  # Non-overlapping 150-row windows, centred in the capture so that the
+  # unused remainder is split evenly between the start and the end.
+  policy: centered_tiling
+
+labels:
+  shared: [SIT, STAND, WALK]
+  room_a:
+    fall: FALL
+    sit: SIT
+    sitdown: SITDOWN
+    stand: STAND
+    standup: STANDUP
+    walk: WALK
+  room_b:
+    empty: EMPTY
+    lying: LYING
+    sitting: SIT
+    standing: STAND
+    walking: WALK
+
+ssl:
+  epochs: 100
+  batch_size: 256
+  lr: 0.001
+  temperature: 0.2
+  seed: 42
+  threads: 10
+  probe_C_grid: [0.01, 0.1, 1.0]            # linear-probe regularization, chosen by grouped CV on development
+
+few_shot:
+  k_values: [1, 5, 10, 20]
+  support_seed: 42
+
+task3:
+  exclusive:                                # target-exclusive activities (K-shot support)
+    A: [FALL, SITDOWN, STANDUP]
+    B: [EMPTY, LYING]
+  support_draws: 5                          # independent support sets per K (draw 0 is reported as the official one)
+  alignments: [pooled, per_room]
+  heads: [logreg, prototype]
+  logreg_C: 0.1                             # fixed a priori: target shared labels are withheld, so no target tuning
+  # none: plain classifier output; uniform: reweight class probabilities so every activity
+  # is predicted equally often on the room's UNLABELLED development windows
+  balancing: [none, uniform]
+  # transitions: for a target room whose K-shot activities include SITDOWN and STANDUP, revise the
+  # shared activities with a label-free walking detector and SIT/STAND examples taken from the first
+  # and last `structure_segment` of each SITDOWN/STANDUP support window (room_structure.py)
+  structure_prior: [none, transitions]
+  structure_segment: 0.3
+
+# The deployed system used by run_episode.py: the Task 3 configuration with the best
+# mean validation primary macro-F1, with predicted-room routing.
+final_model:
+  representation: ssl
+  alignment: per_room
+  head: logreg
+  balancing: uniform
+  structure_prior: transitions              # applied automatically only where it is applicable (Room A)
+  k: 20                                    # default support captures per target-exclusive activity
+  support_draw: 0                           # the official (seed 42, draw 0) support set

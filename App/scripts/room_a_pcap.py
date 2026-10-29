@@ -1,12 +1,11 @@
 """Independent PCAP/CSI reader for Room A (Nexmon BCM4366c0 format).
 
-The decoder logic follows the documented bit layout observed in the supplied 
-`unpack_float.c` reference: 
+The decoder logic follows the packed floating-point layout used by the public
+Nexmon CSI tooling for the BCM4366c0 (seemoo-lab/nexmon_csi, `unpack_float.c`):
 format=1, nman=12, nexp=6, 10-bit autoscaling, 256 CSI words per observation.
 """
 from __future__ import annotations
 
-import math
 import struct
 import zipfile
 from dataclasses import dataclass
@@ -62,8 +61,16 @@ def _decode_pcap_global_header(header: bytes) -> tuple[str, str]:
     return endian, precision
 
 
+class TruncatedCaptureError(ValueError):
+    """Raised when a packet record extends beyond the end of the file."""
+
+
 def _iter_classic_pcap_frames(pcap_bytes: bytes) -> Iterator[tuple[float, bytes, int]]:
-    """Yield (timestamp_seconds, captured_frame_bytes, packet_index)."""
+    """Yield (timestamp_seconds, captured_frame_bytes, packet_index).
+
+    Raises TruncatedCaptureError at an incomplete trailing record, after all
+    complete packets before it have been yielded.
+    """
     if len(pcap_bytes) < 24:
         raise ValueError("File is too short to contain a PCAP global header.")
     endian, precision = _decode_pcap_global_header(pcap_bytes[:24])
@@ -72,13 +79,13 @@ def _iter_classic_pcap_frames(pcap_bytes: bytes) -> Iterator[tuple[float, bytes,
     packet_index = 0
     while offset < len(pcap_bytes):
         if offset + 16 > len(pcap_bytes):
-            raise ValueError(f"Truncated packet header at byte offset {offset}.")
+            raise TruncatedCaptureError(f"Truncated packet header at byte offset {offset}.")
         ts_sec, ts_fraction, incl_len, orig_len = struct.unpack(
             endian + "IIII", pcap_bytes[offset:offset + 16]
         )
         offset += 16
         if offset + incl_len > len(pcap_bytes):
-            raise ValueError(f"Truncated packet data at packet {packet_index}.")
+            raise TruncatedCaptureError(f"Truncated packet data at packet {packet_index}.")
         frame = pcap_bytes[offset:offset + incl_len]
         offset += incl_len
         timestamp = ts_sec + ts_fraction / fraction_scale
@@ -277,7 +284,7 @@ def iter_room_a_csi(
             continue
 
         sequence = int.from_bytes(payload[10:12], "little")
-        core_stream = int.from_bytes(payload[12:14], "big")
+        core_stream = int.from_bytes(payload[12:14], "little")
         chanspec = int.from_bytes(payload[14:16], "little")
         chip_field = int.from_bytes(payload[16:18], "little")
         yield CSIObservation(
@@ -324,3 +331,135 @@ def read_room_a_capture(
     timestamps -= timestamps[0]
     amplitudes = np.stack([o.amplitude for o in observations]).astype(np.float32)
     return timestamps, amplitudes
+
+
+def decode_bcm4366c0_batch(words: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized equivalent of `decode_bcm4366c0_words` for many observations.
+
+    `words` has shape (n_observations, n_subcarriers) of uint32. Autoscaling is
+    computed per observation, exactly as in the per-word decoder. Returns
+    (real, imag) as int64 arrays of the same shape.
+    """
+    raw = np.asarray(words, dtype=np.uint32)
+    if raw.ndim != 2 or raw.shape[1] == 0:
+        raise ValueError(f"Expected a 2D (observations, words) array, got {raw.shape}.")
+
+    nman, nexp, nbits = 12, 6, 10
+    iq_mask = (1 << (nman - 1)) - 1
+    exponent_pivot = 1 << (nexp - 1)
+    real_sign_mask = 1 << (nexp + 2 * nman - 1)
+    imag_sign_mask = real_sign_mask >> nman
+    exponent_zero = -nman
+
+    w = raw.astype(np.int64)
+    vi = (w >> (nexp + nman)) & iq_mask
+    vq = (w >> nexp) & iq_mask
+    exponent = w & ((1 << nexp) - 1)
+    exponent = np.where(exponent >= exponent_pivot, exponent - 2 * exponent_pivot, exponent)
+
+    # Autoscaling: the highest set bit of (vi | vq) plus the word exponent,
+    # maximised over the observation. frexp gives the bit length exactly.
+    x = vi | vq
+    _, bit_length = np.frexp(x.astype(np.float64))
+    scaled_exponent = np.where(x > 0, exponent + bit_length - 1, np.iinfo(np.int64).min)
+    maxbit = np.maximum(scaled_exponent.max(axis=1, keepdims=True), -exponent_pivot)
+    shift = exponent + (nbits - maxbit)
+
+    def scale(mantissa):
+        left = mantissa << np.clip(shift, 0, 40)
+        right = mantissa >> np.clip(-shift, 0, 40)
+        value = np.where(shift >= 0, left, right)
+        return np.where(shift < exponent_zero, 0, value)
+
+    real = scale(vi)
+    imag = scale(vq)
+    real = np.where(w & real_sign_mask, -real, real)
+    imag = np.where(w & imag_sign_mask, -imag, imag)
+    return real, imag
+
+
+@dataclass
+class RoomACapture:
+    """All well-formed CSI observations of one PCAP plus a rejection tally."""
+    amplitude: np.ndarray        # (n, 256) float32
+    timestamp_seconds: np.ndarray  # (n,) float64, relative to the first kept observation
+    sequence: np.ndarray         # (n,) int64, 802.11 sequence-control field (0xFFFF = none)
+    packet_index: np.ndarray     # (n,) int64, record index in the PCAP
+    counts: dict
+
+
+def read_room_a_capture_qc(
+    pcap_bytes: bytes,
+    *,
+    expected_subcarriers: int = 256,
+    udp_port: int | None = 5500,
+    salvage_truncated: bool = True,
+    drop_consecutive_duplicates: bool = True,
+) -> RoomACapture:
+    """Decode one PCAP and account for every packet that is not kept.
+
+    Rejection reasons: not IPv4/UDP, wrong UDP port, missing Nexmon magic,
+    wrong CSI length, all-zero CSI, or an exact repeat of the previous
+    observation's raw CSI words. Temporal order is preserved.
+    """
+    counts = {
+        "packets": 0, "not_udp": 0, "wrong_port": 0, "bad_magic": 0,
+        "bad_length": 0, "zero_csi": 0, "duplicate": 0, "truncated": False,
+    }
+    rows, stamps, seqs, indices = [], [], [], []
+    expected_payload = 18 + 4 * expected_subcarriers
+
+    frames = _iter_classic_pcap_frames(pcap_bytes)
+    while True:
+        try:
+            timestamp, frame, packet_index = next(frames)
+        except StopIteration:
+            break
+        except TruncatedCaptureError:
+            if not salvage_truncated:
+                raise
+            counts["truncated"] = True
+            break
+        counts["packets"] += 1
+        parsed = _parse_ethernet_ipv4_udp(frame)
+        if parsed is None:
+            counts["not_udp"] += 1
+            continue
+        payload, _src, _dst, source_port, dest_port = parsed
+        if udp_port is not None and udp_port not in (source_port, dest_port):
+            counts["wrong_port"] += 1
+            continue
+        if payload[:4] != b"\x11\x11\x11\x11":
+            counts["bad_magic"] += 1
+            continue
+        if len(payload) != expected_payload:
+            counts["bad_length"] += 1
+            continue
+        words = np.frombuffer(payload[18:], dtype="<u4")
+        if not words.any():
+            counts["zero_csi"] += 1
+            continue
+        if drop_consecutive_duplicates and rows and np.array_equal(words, rows[-1]):
+            counts["duplicate"] += 1
+            continue
+        rows.append(words)
+        stamps.append(timestamp)
+        seqs.append(int.from_bytes(payload[10:12], "little"))
+        indices.append(packet_index)
+
+    if rows:
+        real, imag = decode_bcm4366c0_batch(np.stack(rows))
+        amplitude = np.hypot(real.astype(np.float64), imag.astype(np.float64)).astype(np.float32)
+        stamps = np.asarray(stamps, dtype=np.float64)
+        stamps -= stamps[0]
+    else:
+        amplitude = np.zeros((0, expected_subcarriers), dtype=np.float32)
+        stamps = np.zeros(0, dtype=np.float64)
+    counts["kept"] = len(rows)
+    return RoomACapture(
+        amplitude=amplitude,
+        timestamp_seconds=stamps,
+        sequence=np.asarray(seqs, dtype=np.int64),
+        packet_index=np.asarray(indices, dtype=np.int64),
+        counts=counts,
+    )

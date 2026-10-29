@@ -1,0 +1,61 @@
+{
+  "preprocessing_id": "8fcdd9246c",
+  "room_a": {
+    "udp_port": 5500,
+    "expected_subcarriers": 256,
+    "salvage_truncated": true
+  },
+  "room_b": {
+    "validation_per_class": 25,
+    "split_seed": 42
+  },
+  "quality": {
+    "subchannels": {
+      "sub1": [
+        134,
+        187
+      ],
+      "sub2": [
+        196,
+        255
+      ],
+      "sub3": [
+        2,
+        61
+      ],
+      "sub4": [
+        68,
+        123
+      ]
+    },
+    "occupied_fraction": 0.1,
+    "empty_amplitude": 1.0,
+    "drop_consecutive_duplicates": true
+  },
+  "window": {
+    "length": 150,
+    "policy": "centered_tiling"
+  },
+  "labels": {
+    "shared": [
+      "SIT",
+      "STAND",
+      "WALK"
+    ],
+    "room_a": {
+      "fall": "FALL",
+      "sit": "SIT",
+      "sitdown": "SITDOWN",
+      "stand": "STAND",
+      "standup": "STANDUP",
+      "walk": "WALK"
+    },
+    "room_b": {
+      "empty": "EMPTY",
+      "lying": "LYING",
+      "sitting": "SIT",
+      "standing": "STAND",
+      "walking": "WALK"
+    }
+  }
+}
