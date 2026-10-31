@@ -88,6 +88,16 @@ task3:
   # and last `structure_segment` of each SITDOWN/STANDUP support window (room_structure.py)
   structure_prior: [none, transitions]
   structure_segment: 0.3
+  # Refinements for a target room whose shared activities come from the structure prior (Room A as target),
+  # where the classifier mainly has to recognise the K-shot activities. Added one at a time to the best grid
+  # configuration in refinement_effect.csv (also computed for target Room B, where they do not help):
+  #   sway       postural sway also votes on SIT vs STAND (room_structure.py)
+  #   ensemble   average of the balanced probabilities of the SSL and handcrafted models
+  #   smoothing  each window's probabilities combined (geometric mean) with the mean probabilities of its
+  #              k-means cluster of unlabelled target development windows
+  refinements: [sway, ensemble, smoothing]
+  smoothing_clusters_per_class: 3
+  smoothing_components: 32                  # PCA components of the standardized SSL features before k-means
 
 # The deployed system used by run_episode.py: the Task 3 configuration with the best
 # mean validation primary macro-F1, with predicted-room routing.
@@ -97,5 +107,6 @@ final_model:
   head: logreg
   balancing: uniform
   structure_prior: transitions              # applied automatically only where it is applicable (Room A)
+  refinements: [sway, ensemble, smoothing]  # only together with the structure prior (Room A)
   k: 20                                    # default support captures per target-exclusive activity
   support_draw: 0                           # the official (seed 42, draw 0) support set

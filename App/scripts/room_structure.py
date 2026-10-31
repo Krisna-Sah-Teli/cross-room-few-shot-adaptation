@@ -11,12 +11,18 @@ STANDUP (Room A as target). It never reads a target-room SIT/STAND/WALK label:
      STAND and SIT examples recorded in the target room itself. A logistic regression learns
      SIT vs STAND (and the support activities) from the mean log-shape of full 80 MHz
      observations over all 256 subcarriers.
+  3. Postural sway (optional). People sway more when standing than when sitting. The sway score is
+     the order-free spread of a window's full 80 MHz observations. Among the unlabelled target
+     development windows that the adapted classifier assigns to a shared activity and the walking
+     detector does not flag, the higher-sway half leans STAND (a median split: equal proportions,
+     the same assumption as class balancing); this vote is averaged with the posture classifier's.
 The adapted classifier's predictions are then revised: a window flagged by the detector
 becomes WALK (unless the classifier says FALL); other windows the classifier assigns to a
-shared activity get SIT or STAND from the posture classifier.
+shared activity get SIT or STAND from the posture classifier (and the sway vote).
 """
 
 import numpy as np
+from scipy.special import expit
 from sklearn.linear_model import LogisticRegression
 
 from scripts.csi_quality import classify_band_coverage
@@ -52,11 +58,24 @@ def motion_score(rows, quality):
     return float(np.median(B.mean(axis=1).var(axis=0, ddof=1) / np.maximum(B.var(axis=1, ddof=1).mean(axis=0), 1e-9)))
 
 
+def sway_score(rows, quality):
+    """Order-free spread of the full 80 MHz observations: median over the 256 subcarriers of the
+    standard deviation of the log-shape; NaN if fewer than 10 observations."""
+    full = rows[classify_band_coverage(rows, quality) == "full"]
+    if len(full) < 2 * BLOCK:
+        return np.nan
+    return float(np.median(_log_shape(full).std(axis=0, ddof=1)))
+
+
 def structure_features(X, quality):
-    """(posture shapes (n, 256), motion scores (n,)) for raw windows X (n, 150, 256)."""
-    shapes = np.stack([posture_shape(np.asarray(x), quality) for x in X])
-    motion = np.array([motion_score(np.asarray(x), quality) for x in X])
-    return shapes, motion
+    """(posture shapes (n, 256), motion scores (n,), sway scores (n,)) for raw windows X (n, 150, 256)."""
+    shapes, motion, sway = [], [], []
+    for x in X:
+        rows = np.asarray(x)
+        shapes.append(posture_shape(rows, quality))
+        motion.append(motion_score(rows, quality))
+        sway.append(sway_score(rows, quality))
+    return np.stack(shapes), np.array(motion), np.array(sway)
 
 
 def walking_threshold(motion):
@@ -93,10 +112,11 @@ def posture_examples(windows, labels, quality, segment=0.3):
 
 
 class StructurePrior:
-    """Walking detector + transition-derived posture classifier for one target room."""
+    """Walking detector + transition-derived posture classifier (+ optional sway vote) for one target room."""
 
-    def __init__(self, threshold, mean, std, classifier):
+    def __init__(self, threshold, mean, std, classifier, sway=None):
         self.threshold, self.mean, self.std, self.classifier = threshold, mean, std, classifier
+        self.sway = sway                                   # (centre, scale) of the log sway score, or None
 
     @classmethod
     def fit(cls, dev_shapes, dev_motion, example_shapes, example_labels, C=0.1):
@@ -106,28 +126,49 @@ class StructurePrior:
         return cls(walking_threshold(dev_motion), mean, std, None).refit(example_shapes, example_labels, C)
 
     def refit(self, example_shapes, example_labels, C=0.1):
-        """Same detector and standardization, posture classifier trained on new support examples."""
+        """Same detector, standardization and sway reference, posture classifier trained on new support examples."""
         if not {"SIT", "STAND"} <= set(example_labels):
             raise ValueError("posture examples must contain SIT and STAND (from SITDOWN/STANDUP support)")
         classifier = LogisticRegression(C=C, class_weight="balanced", max_iter=3000)
         classifier.fit(np.nan_to_num((example_shapes - self.mean) / self.std), example_labels)
-        return StructurePrior(self.threshold, self.mean, self.std, classifier)
+        return StructurePrior(self.threshold, self.mean, self.std, classifier, self.sway)
 
-    def revise(self, shapes, motion, predicted, confidence, shared_labels):
+    def walking(self, motion, predicted):
+        """Windows the detector flags as WALK (a FALL decision of the classifier is never overridden)."""
+        return (np.nan_to_num(motion, nan=np.inf) < self.threshold) & (predicted != "FALL")
+
+    def with_sway(self, dev_sway, dev_motion, dev_predicted, shared_labels):
+        """The same prior with a sway reference from unlabelled development windows that the adapted
+        classifier assigns to a shared activity and the detector does not flag."""
+        log_sway = np.log(dev_sway)
+        pool = log_sway[np.isin(dev_predicted, shared_labels) & ~self.walking(dev_motion, dev_predicted)
+                        & np.isfinite(log_sway)]
+        sway = None
+        if pool.size >= 2:
+            q25, q50, q75 = np.percentile(pool, [25, 50, 75])
+            sway = (q50, max((q75 - q25) / 1.349, 1e-6))
+        return StructurePrior(self.threshold, self.mean, self.std, self.classifier, sway)
+
+    def revise(self, shapes, motion, predicted, confidence, shared_labels, sway=None):
         """Revised (labels, confidences) for windows the adapted classifier labelled `predicted`.
 
         Unchanged windows keep the classifier's confidence. SIT/STAND decisions take the posture
-        classifier's probability (normalized over SIT and STAND). Detector WALK decisions take
+        classifier's probability (normalized over SIT and STAND), averaged with the sway vote when
+        the prior has a sway reference and `sway` scores are given. Detector WALK decisions take
         1 - score/threshold, clipped to [0.5, 1]: a monotone score, not a calibrated probability.
         """
         proba = self.classifier.predict_proba(np.nan_to_num((shapes - self.mean) / self.std))
         keep = np.isin(self.classifier.classes_, ["SIT", "STAND"])
         sit_stand = proba[:, keep] / np.maximum(proba[:, keep].sum(axis=1, keepdims=True), 1e-12)
-        posture = self.classifier.classes_[keep][sit_stand.argmax(axis=1)]
+        p_stand = sit_stand[:, list(self.classifier.classes_[keep]).index("STAND")]
+        if self.sway is not None and sway is not None:
+            z = (np.log(sway) - self.sway[0]) / self.sway[1]
+            p_stand = (p_stand + np.where(np.isfinite(z), expit(np.nan_to_num(z)), 0.5)) / 2
+        posture = np.where(p_stand > 0.5, "STAND", "SIT")
         score = np.nan_to_num(motion, nan=np.inf)
-        walking = (score < self.threshold) & (predicted != "FALL")
+        walking = self.walking(motion, predicted)
         shared = np.isin(predicted, shared_labels)
         labels = np.where(walking, "WALK", np.where(shared, posture, predicted))
         conf = np.where(walking, np.clip(1 - score / self.threshold, 0.5, 1.0),
-                        np.where(shared, sit_stand.max(axis=1), confidence))
+                        np.where(shared, np.maximum(p_stand, 1 - p_stand), confidence))
         return labels, conf

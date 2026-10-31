@@ -12,8 +12,18 @@ Grid (all evaluated on the fixed target validation windows, oracle routing):
                   the start and end of the transition support windows (room_structure.py)
 Every (direction, K) is repeated for several support draws; the mean and std are reported.
 
-Routing study for the best grid configuration (each model balanced, if enabled, on the
-unlabelled development windows of the room(s) it serves):
+Refinements, added one at a time to the best grid configuration (refinement_effect.csv). They
+are meant for a target room whose shared activities come from the structure prior (Room A),
+where the classifier mainly has to recognise the K-shot activities; they are also computed for
+target Room B, where they do not help, and the reported system uses them only with the prior:
+  sway       postural sway also votes on SIT vs STAND (room_structure.py)
+  ensemble   average of the balanced probabilities of the SSL and handcrafted models
+  smoothing  each window's probabilities combined with the mean probabilities of its k-means
+             cluster of unlabelled target development windows
+
+Routing study for the reported system (the best grid configuration with its refinements where
+the prior applies; each model balanced, if enabled, on the unlabelled development windows of
+the room(s) it serves):
   oracle     the true room selects the room-specific normalization and label space
   predicted  the Task 1 room router selects them (a window routed to the source room
              is classified by a source-room model with the source label space)
@@ -35,14 +45,15 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.config import load_config
-from scripts.few_shot_adaptation import (apply_stats, balancing_weights, fit_stats, make_head, predict,
-                                         score, select_support)
+from scripts.few_shot_adaptation import (ClusterSmoother, apply_stats, balanced_proba, balancing_weights, fit_stats,
+                                         make_head, predict, score, select_support)
 from scripts.room_fingerprint import window_features
 from scripts.room_structure import StructurePrior, applicable, posture_examples, structure_features
 from scripts.ssl_encoder import CSIEncoder, embed, prepare_input
 
 DIRECTIONS = [("A", "B"), ("B", "A")]
 METRICS = ["primary_macro_f1", "exclusive_macro_f1", "shared_macro_f1", "balanced_accuracy", "accuracy"]
+ENSEMBLE = ("ssl", "handcrafted")
 
 
 def build_representations(X, config, task2_dir):
@@ -64,6 +75,7 @@ class Experiment:
         self.labels = windows.label.to_numpy()
         self.capture = windows.capture_id.to_numpy()
         self.cfg = config["task3"]
+        self.quality = config["quality"]
         self.shared_labels = config["labels"]["shared"]
         self.exclusive = {"A": self.cfg["exclusive"]["A"], "B": self.cfg["exclusive"]["B"]}
         dev = (windows.split == "development").to_numpy()
@@ -106,6 +118,60 @@ class Experiment:
 
     def evaluate(self, pred, target):
         return score(self.labels[self.val[target]], pred, self.shared_labels, self.exclusive[target])
+
+    def prior(self, X, structure, target, support_captures):
+        """Room-structure prior from unlabelled target development windows and the support windows."""
+        shapes, motion, _ = structure
+        sup = np.flatnonzero(self.dev[target] & np.isin(self.capture, support_captures))
+        ex_shapes, ex_labels, _ = posture_examples(X[sup], self.labels[sup], self.quality,
+                                                   self.cfg["structure_segment"])
+        return StructurePrior.fit(shapes[self.dev[target]], motion[self.dev[target]], ex_shapes, ex_labels,
+                                  C=self.cfg["logreg_C"])
+
+    def smoother(self, F, room):
+        """(cluster smoother, standardization) of the room's unlabelled development windows."""
+        stats = fit_stats(F[self.dev[room]])
+        n_clusters = self.cfg["smoothing_clusters_per_class"] * (len(self.shared_labels) + len(self.exclusive[room]))
+        smoother = ClusterSmoother(n_clusters, self.cfg["smoothing_components"])
+        return smoother.fit(apply_stats(F[self.dev[room]], stats)), stats
+
+    def system(self, reps, structure, settings, source, target, support_captures, refinements=(), prior=None,
+               smoother=None):
+        """Validation (labels, confidences) of one episode: the adapted classifier, revised by `prior` if given.
+
+        refinements: "ensemble" averages the balanced probabilities of the SSL and handcrafted models,
+        "smoothing" applies `smoother` (from `self.smoother` on SSL features), "sway" adds the sway vote.
+        """
+        dev, val = self.dev[target], self.val[target]
+        P_dev, P_val = [], []
+        for name in (ENSEMBLE if "ensemble" in refinements else [settings["representation"]]):
+            F = reps[name]
+            model, stats = self.target_model(F, settings["alignment"], settings["head"], source, target, support_captures)
+            weights = self.balance(model, F, stats, dev, settings["balancing"])
+            P_dev.append(balanced_proba(model, apply_stats(F[dev], stats), weights))
+            P_val.append(balanced_proba(model, apply_stats(F[val], stats), weights))
+        classes, P_dev, P_val = model.classes_, np.mean(P_dev, axis=0), np.mean(P_val, axis=0)
+        if "smoothing" in refinements:
+            clusters, stats = smoother
+            P_val = clusters.smooth(P_val, clusters.assign(apply_stats(reps["ssl"][val], stats)),
+                                    clusters.cluster_means(P_dev))
+        pred, conf = classes[P_val.argmax(axis=1)], P_val.max(axis=1)
+        if prior is None:
+            return pred, conf
+        shapes, motion, sway = structure
+        if "sway" in refinements:
+            prior = prior.with_sway(sway[dev], motion[dev], classes[P_dev.argmax(axis=1)], self.shared_labels)
+        return prior.revise(shapes[val], motion[val], pred, conf, self.shared_labels, sway[val])
+
+    def reported_system(self, X, reps, structure, settings, source, target, support_captures):
+        """The configuration in `settings` (e.g. final_model), fitted from scratch: structure prior and
+        refinements only where the prior applies."""
+        if not (settings["structure_prior"] == "transitions" and applicable(self.exclusive[target])):
+            return self.system(reps, structure, settings, source, target, support_captures)
+        refinements = settings.get("refinements", ())
+        smoother = self.smoother(reps["ssl"], target) if "smoothing" in refinements else None
+        return self.system(reps, structure, settings, source, target, support_captures, refinements,
+                           self.prior(X, structure, target, support_captures), smoother)
 
 
 INK, MUTED, GRID, SURFACE = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
@@ -214,9 +280,11 @@ def make_figures(out_dir, windows, config):
         label += f", {ranking.balancing} balancing"
     if "structure_prior" in ranking and ranking.structure_prior != "none":
         label += f", {ranking.structure_prior} prior"
+        if config["task3"].get("refinements"):
+            label += f"\n+ {', '.join(config['task3']['refinements'])} where the prior applies (target Room A)"
     routing_summary = pd.read_csv(out_dir / "routing_summary.csv")
     plot_label_efficiency(routing_summary[routing_summary.routing == "predicted"],
-                          out_dir / "fig_label_efficiency.png", f"Label efficiency - {label} (predicted-room routing)")
+                          out_dir / "fig_label_efficiency.png", f"Label efficiency (predicted-room routing) - {label}")
     plot_routing(routing_summary, out_dir / "fig_routing_contribution.png",
                  f"Routing contribution - {label}\n"
                  "(predicted-room and oracle routing coincide: the Task 1 router is 100% correct)")
@@ -288,27 +356,23 @@ def main():
 
     # Target-room structure priors: fitted only from unlabelled target development windows and the
     # support windows (never from target SIT/STAND/WALK labels); independent of the representation.
-    quality = config["quality"]
     use_prior = {room: applicable(exp.exclusive[room]) for room in "AB"}
-    priors = {}
+    priors, structure = {}, None
     if "transitions" in cfg["structure_prior"] and any(use_prior.values()):
-        shapes, motion = structure_features(X, quality)
+        structure = structure_features(X, config["quality"])
         for source, target in DIRECTIONS:
             if not use_prior[target]:
                 continue
             for draw in range(cfg["support_draws"]):
                 for k in k_values:
-                    sup = np.flatnonzero(exp.dev[target] & np.isin(exp.capture, supports[(target, draw)][k]))
-                    ex_shapes, ex_labels, _ = posture_examples(X[sup], exp.labels[sup], quality,
-                                                               cfg["structure_segment"])
-                    priors[(target, draw, k)] = StructurePrior.fit(
-                        shapes[exp.dev[target]], motion[exp.dev[target]], ex_shapes, ex_labels, C=cfg["logreg_C"])
+                    priors[(target, draw, k)] = exp.prior(X, structure, target, supports[(target, draw)][k])
         print(f"  structure prior fitted for target room(s) {[r for r in 'AB' if use_prior[r]]}", flush=True)
 
     def revise(pred, conf, target, draw, k, prior):
         if prior == "none" or not use_prior[target]:
             return pred, conf
         val = exp.val[target]
+        shapes, motion, _ = structure
         return priors[(target, draw, k)].revise(shapes[val], motion[val], pred, conf, exp.shared_labels)
 
     # 1. Grid with oracle routing.
@@ -358,7 +422,31 @@ def main():
         print(f"\nEffect of {name} (mean over draws, {fixed[0]} = {fixed[1]}):")
         print(effect.to_string())
 
-    # 2. Routing study, predictions and confusion matrices for the best configuration.
+    # 2. Refinements added one at a time to the best configuration (sway needs the structure prior).
+    best = {"representation": best_rep, "alignment": best_align, "head": best_head, "balancing": best_balancing,
+            "structure_prior": best_prior, "refinements": list(cfg["refinements"])}
+    smoothers = {room: exp.smoother(reps["ssl"], room) for room in "AB"}
+    steps = [cfg["refinements"][:i] for i in range(len(cfg["refinements"]) + 1)]
+    rows = []
+    for source, target in DIRECTIONS:
+        for draw in range(cfg["support_draws"]):
+            for k in k_values:
+                prior = priors.get((target, draw, k)) if best_prior == "transitions" else None
+                for step in steps:
+                    pred, _ = exp.system(reps, structure, best, source, target, supports[(target, draw)][k], step,
+                                         prior, smoothers[target])
+                    rows.append({"target_room": target, "K": k, "draw": draw,
+                                 "refinements": " + ".join(step) or "none", **exp.evaluate(pred, target)})
+    refinement = pd.DataFrame(rows)
+    effect = refinement.groupby(["target_room", "K", "refinements"])[
+        ["primary_macro_f1", "exclusive_macro_f1", "shared_macro_f1"]].mean().unstack("refinements").round(4)
+    effect.to_csv(out_dir / "refinement_effect.csv")
+    print("\nRefinements added one at a time (mean primary macro-F1 over K and draws; "
+          "the reported system uses them only where the structure prior applies):")
+    print(refinement.groupby(["target_room", "refinements"]).primary_macro_f1.mean().unstack("target_room")
+          .round(4).to_string())
+
+    # 3. Routing study, predictions and confusion matrices for the reported system.
     F = reps[best_rep]
     router = pd.read_csv(results_dir / "task1" / "predictions_validation.csv").set_index("window_id")["room"]
     routing_rows = []
@@ -368,13 +456,14 @@ def main():
         source_model, s_stats = exp.source_model(F, best_align, best_head, source)
         source_weights = exp.balance(source_model, F, s_stats, exp.dev[source], best_balancing)
         source_pred, source_conf = predict(source_model, apply_stats(F[exp.val[target]], s_stats), source_weights)
+        with_prior = best_prior == "transitions" and use_prior[target]
+        refinements = list(cfg["refinements"]) if with_prior else []
         for k in k_values:
             for draw in range(cfg["support_draws"]):
                 support = supports[(target, draw)][k]
-                model, t_stats = exp.target_model(F, best_align, best_head, source, target, support)
-                weights = exp.balance(model, F, t_stats, exp.dev[target], best_balancing)
-                oracle_pred, oracle_conf = predict(model, apply_stats(F[exp.val[target]], t_stats), weights)
-                oracle_pred, oracle_conf = revise(oracle_pred, oracle_conf, target, draw, k, best_prior)
+                oracle_pred, oracle_conf = exp.system(reps, structure, best, source, target, support, refinements,
+                                                      priors[(target, draw, k)] if with_prior else None,
+                                                      smoothers[target])
                 to_target = routed_room == target
                 routed_pred = np.where(to_target, oracle_pred, source_pred)
                 routed_conf = np.where(to_target, oracle_conf, source_conf)
@@ -393,7 +482,7 @@ def main():
     routing_summary = summarize(routing, ["source_room", "target_room", "routing", "K"])
     routing_summary.to_csv(out_dir / "routing_summary.csv", index=False)
 
-    # 3. Metrics in the challenge format (mean over support draws; std as its own metric).
+    # 4. Metrics in the challenge format (mean over support draws; std as its own metric).
     best_summary = routing_summary[routing_summary.routing == "predicted"]
     metric_rows = []
     for row in best_summary.itertuples(index=False):

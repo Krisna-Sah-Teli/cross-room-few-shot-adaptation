@@ -1,4 +1,4 @@
-"""Leakage checks for few-shot support selection and class balancing. Run with `python App/tests/test_few_shot.py`."""
+"""Checks of few-shot support selection, class balancing and cluster smoothing. Run with `python App/tests/test_few_shot.py`."""
 
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.config import load_config
-from scripts.few_shot_adaptation import balancing_weights, select_support
+from scripts.few_shot_adaptation import ClusterSmoother, balancing_weights, select_support
 
 CONFIG = load_config()
 WINDOWS = pd.read_csv(CONFIG["paths"]["data_dir"] / "windows_manifest.csv")
@@ -54,6 +54,17 @@ def test_balancing_equalizes_mean_class_probabilities():
 def test_balancing_leaves_balanced_predictions_unchanged():
     p = np.full((100, 3), 1 / 3)
     assert np.allclose(balancing_weights(p), 1 / 3)
+
+
+def test_cluster_smoothing_pulls_windows_towards_their_cluster():
+    rng = np.random.default_rng(3)
+    centres = np.array([[5.0] * 4, [-5.0] * 4])
+    smoother = ClusterSmoother(n_clusters=2, n_components=2).fit(
+        np.vstack([c + rng.normal(scale=0.1, size=(50, 4)) for c in centres]))
+    means = smoother.cluster_means(np.vstack([np.tile([0.9, 0.1], (50, 1)), np.tile([0.2, 0.8], (50, 1))]))
+    smoothed = smoother.smooth(np.full((2, 2), [0.4, 0.6]), smoother.assign(centres), means)
+    assert np.allclose(smoothed.sum(axis=1), 1)
+    assert smoothed[0, 0] > 0.5 > smoothed[1, 0]                # each undecided window follows its cluster
 
 
 if __name__ == "__main__":

@@ -17,9 +17,15 @@ every activity is predicted equally often. Target class proportions are unknown,
 so equal proportions are the neutral assumption, and they match macro-F1, which
 weighs every activity equally. This prevents a classifier from systematically
 starving some activities in a room it was not trained on.
+
+Optional cluster smoothing also uses unlabelled development windows only: they are
+grouped by k-means, and each window's probabilities are combined with the mean
+probabilities of its group, so that similar-looking windows get similar answers.
 """
 
 import numpy as np
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score, f1_score
 
@@ -102,13 +108,47 @@ def balancing_weights(proba_reference, iterations=200, tolerance=1e-6):
     return weights / weights.sum()
 
 
-def predict(head, F, weights=None):
-    """Labels and confidences; `weights` (from `balancing_weights`) rescale the class probabilities."""
+def balanced_proba(head, F, weights=None):
+    """Class probabilities, rescaled by `weights` (from `balancing_weights`) when given."""
     proba = head.predict_proba(F)
     if weights is not None:
         proba = proba * weights
         proba /= proba.sum(axis=1, keepdims=True)
+    return proba
+
+
+def predict(head, F, weights=None):
+    """Labels and confidences; `weights` (from `balancing_weights`) rescale the class probabilities."""
+    proba = balanced_proba(head, F, weights)
     return head.classes_[proba.argmax(axis=1)], proba.max(axis=1)
+
+
+class ClusterSmoother:
+    """k-means groups of unlabelled development windows (after PCA) for smoothing class probabilities."""
+
+    def __init__(self, n_clusters, n_components=32, seed=0):
+        self.n_clusters, self.n_components, self.seed = n_clusters, n_components, seed
+
+    def fit(self, F_dev):
+        self.pca_ = PCA(self.n_components, random_state=self.seed).fit(F_dev)
+        self.kmeans_ = KMeans(self.n_clusters, n_init=10, random_state=self.seed).fit(self.pca_.transform(F_dev))
+        return self
+
+    def assign(self, F):
+        return self.kmeans_.predict(self.pca_.transform(F))
+
+    def cluster_means(self, P_dev):
+        """Mean class probabilities of each group, from the probabilities of the windows it was fitted on."""
+        groups = self.kmeans_.labels_
+        uniform = np.full(P_dev.shape[1], 1 / P_dev.shape[1])
+        return np.stack([P_dev[groups == c].mean(axis=0) if (groups == c).any() else uniform
+                         for c in range(self.n_clusters)])
+
+    @staticmethod
+    def smooth(P, groups, means):
+        """Geometric mean of each window's probabilities and its group's mean probabilities."""
+        S = np.sqrt(P * means[groups])
+        return S / S.sum(axis=1, keepdims=True)
 
 
 def score(truth, pred, shared_labels, exclusive_labels):

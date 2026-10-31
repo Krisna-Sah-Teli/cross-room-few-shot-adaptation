@@ -37,13 +37,16 @@ def main():
         "label_sets": bundle["label_sets"],
         "support_captures": {room: r["support_captures"] for room, r in bundle["rooms"].items()},
         "structure_prior_rooms": [room for room, r in bundle["rooms"].items() if r.get("structure")],
+        "refinements": {room: r["refinements"] for room, r in bundle["rooms"].items()},
         "build_seconds": bundle["build_seconds"],
     }
     (out_dir / "bundle_info.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(f"Saved {out_dir / 'bundle.pkl'} ({(out_dir / 'bundle.pkl').stat().st_size / 1e6:.1f} MB, "
           f"built in {bundle['build_seconds']}s)")
     for room, r in bundle["rooms"].items():
-        print(f"  Room {room}: {len(r['support_captures'])} support captures, classes {list(r['model'].classes_)}")
+        classes = list(next(iter(r["models"].values()))[0].classes_)
+        print(f"  Room {room}: {len(r['support_captures'])} support captures, models {r['representations']}, "
+              f"refinements {r['refinements'] or 'none'}, classes {classes}")
 
 
 if __name__ == "__main__":

@@ -59,6 +59,24 @@ def test_revision_rules():
     assert ((conf >= 0) & (conf <= 1)).all()
 
 
+def test_sway_reference_and_vote():
+    rng = np.random.default_rng(2)
+    shapes = rng.normal(size=(40, 256))
+    labels = np.array(["SIT", "STAND", "FALL", "SITDOWN"] * 10)
+    prior = StructurePrior.fit(shapes, np.r_[np.full(20, 0.2), np.full(20, 5.0)], shapes, labels)
+    shared = ["SIT", "STAND", "WALK"]
+    dev_predicted = np.array(["SIT", "STAND", "WALK", "SIT", "STAND", "SIT", "SIT", "FALL"])
+    dev_motion = np.array([5.0] * 6 + [0.1, 5.0])               # window 6 is flagged as walking
+    swaying = prior.with_sway(np.exp(np.arange(8.0)), dev_motion, dev_predicted, shared)
+    assert np.isclose(swaying.sway[0], np.median(np.arange(6.0)))   # reference: shared, not flagged (windows 0-5)
+    same_shape = rng.normal(size=(1, 256)).repeat(2, axis=0)
+    args = (same_shape, np.full(2, 5.0), np.array(["SIT", "SIT"]), np.full(2, 0.7), shared)
+    revised, _ = swaying.revise(*args, sway=np.exp([100.0, -100.0]))
+    assert list(revised) == ["STAND", "SIT"]                    # strong sway -> STAND, none -> SIT
+    plain, _ = prior.revise(*args, sway=np.exp([100.0, -100.0]))
+    assert plain[0] == plain[1]                                 # no sway reference: posture classifier only
+
+
 if __name__ == "__main__":
     for name, test in list(globals().items()):
         if name.startswith("test_"):

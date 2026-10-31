@@ -16,7 +16,10 @@ model: shared activities learned from the other room's development windows, targ
 activities from the support set, with per-room alignment and class balancing computed on
 unlabelled development windows. For a room whose K-shot activities include SITDOWN and
 STANDUP (Room A), the shared activities are then revised by the room-structure prior
-(room_structure.py). All inputs use the full 256 subcarriers.
+(room_structure.py), with the refinements of `final_model`: the SSL and handcrafted models'
+probabilities are averaged, smoothed over k-means clusters of the room's unlabelled
+development windows, and postural sway votes on SIT vs STAND. All inputs use the full 256
+subcarriers.
 """
 
 import pickle
@@ -30,8 +33,8 @@ from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
 
 from scripts.config import preprocessing_fingerprint
 from scripts.csi_quality import classify_band_coverage, consecutive_duplicate_mask
-from scripts.few_shot_adaptation import (apply_stats, balancing_weights, fit_stats, make_head, predict,
-                                         select_support)
+from scripts.few_shot_adaptation import (ClusterSmoother, apply_stats, balanced_proba, balancing_weights, fit_stats,
+                                         make_head, select_support)
 from scripts.room_a_pcap import read_room_a_capture_qc
 from scripts.room_fingerprint import normalize, window_features
 from scripts.room_structure import StructurePrior, applicable, posture_examples, structure_features
@@ -39,6 +42,7 @@ from scripts.ssl_encoder import CSIEncoder, embed, prepare_input
 from scripts.window_extraction import centered_tiling_starts
 
 ROOMS = ("A", "B")
+ENSEMBLE = ("ssl", "handcrafted")
 RESERVED_FILES = {"support.csv", "labels.csv", "predictions.csv", "predictions_details.csv"}
 
 
@@ -108,9 +112,9 @@ def load_episode_inputs(folder, config):
 
 # ------------------------------------------------------------------ the trained system
 
-def compute_features(bundle, X):
+def compute_features(bundle, X, representation):
     inputs = prepare_input(X)
-    if bundle["representation"] == "handcrafted":
+    if representation == "handcrafted":
         return window_features(inputs)
     encoder = CSIEncoder(bundle["encoder"]["in_channels"])
     encoder.load_state_dict(bundle["encoder"]["state_dict"])
@@ -125,80 +129,139 @@ def route(bundle, X):
     return np.array(ROOMS)[proba.argmax(axis=1)], proba.max(axis=1)
 
 
-def fit_room_model(bundle, room, support_features, support_labels):
-    """Classifier for windows routed to `room`: shared activities from the other room plus the support set."""
+def fit_room_models(bundle, room, support_features, support_labels):
+    """Classifiers for windows routed to `room`, one per representation: shared activities from the other
+    room plus the support set, each balanced on the room's unlabelled development windows."""
     settings = bundle["settings"]
-    other = bundle["rooms"]["B" if room == "A" else "A"]
-    train = np.vstack([other["shared_features"], support_features])
-    labels = np.concatenate([other["shared_labels"], support_labels])
-    model = make_head(settings["head"], settings["logreg_C"]).fit(train, labels)
-    weights = None
-    if settings["balancing"] == "uniform":
-        weights = balancing_weights(model.predict_proba(bundle["rooms"][room]["dev_features"]))
-    return model, weights
+    r, other = bundle["rooms"][room], bundle["rooms"]["B" if room == "A" else "A"]
+    models = {}
+    for rep in r["representations"]:
+        model = make_head(settings["head"], settings["logreg_C"]).fit(
+            np.vstack([other["shared_features"][rep], support_features[rep]]),
+            np.concatenate([other["shared_labels"], support_labels]))
+        weights = None
+        if settings["balancing"] == "uniform":
+            weights = balancing_weights(model.predict_proba(r["dev_features"][rep]))
+        models[rep] = (model, weights)
+    return models
 
 
-def build_bundle(config):
-    """Train the deployed system from the development data and the Task 1 / Task 2 outputs."""
+def room_proba(models, features):
+    """Balanced class probabilities averaged over a room's models (`features`: representation -> aligned)."""
+    return np.mean([balanced_proba(model, features[rep], weights) for rep, (model, weights) in models.items()],
+                   axis=0)
+
+
+def calibrate(bundle, room, models, prior):
+    """The parts that depend on the room's classifiers: cluster means for smoothing and the sway reference."""
+    r = bundle["rooms"][room]
+    if not r["refinements"]:
+        return None, prior
+    P_dev = room_proba(models, r["dev_features"])
+    means = r["smoother"][0].cluster_means(P_dev) if "smoothing" in r["refinements"] else None
+    if prior is not None and "sway" in r["refinements"]:
+        classes = next(iter(models.values()))[0].classes_
+        prior = prior.with_sway(r["structure"]["dev_sway"], r["structure"]["dev_motion"],
+                                classes[P_dev.argmax(axis=1)], bundle["shared_labels"])
+    return means, prior
+
+
+def build_bundle(config, windows=None):
+    """Train the deployed system from the development data and the Task 1 / Task 2 outputs.
+
+    `windows` replaces the windows manifest; the leakage tests use it to hide labels.
+    """
     started = time.time()
-    settings = dict(config["final_model"], logreg_C=config["task3"]["logreg_C"],
-                    structure_segment=config["task3"]["structure_segment"])
+    task3 = config["task3"]
+    settings = dict(config["final_model"], logreg_C=task3["logreg_C"], structure_segment=task3["structure_segment"],
+                    smoothing_clusters_per_class=task3["smoothing_clusters_per_class"],
+                    smoothing_components=task3["smoothing_components"])
     quality = config["quality"]
     paths = config["paths"]
-    windows = pd.read_csv(paths["data_dir"] / "windows_manifest.csv")
+    if windows is None:
+        windows = pd.read_csv(paths["data_dir"] / "windows_manifest.csv")
     X = np.load(paths["data_dir"] / "windows_X.npy", mmap_mode="r")
     with open(paths["results_dir"] / "task1" / "room_router.pkl", "rb") as f:
         router = pickle.load(f)
     checkpoint = torch.load(paths["results_dir"] / "task2" / "encoder.pt", weights_only=False)
+    shared_labels = list(config["labels"]["shared"])
     bundle = {
         "settings": settings,
-        "representation": settings["representation"],
         "router": router,
         "encoder": {"state_dict": checkpoint["state_dict"], "in_channels": checkpoint["in_channels"]},
-        "label_sets": {room: list(config["labels"]["shared"]) + list(config["task3"]["exclusive"][room])
-                       for room in ROOMS},
+        "label_sets": {room: shared_labels + list(task3["exclusive"][room]) for room in ROOMS},
         "preprocessing_id": preprocessing_fingerprint(config),
         "quality": quality,
-        "shared_labels": list(config["labels"]["shared"]),
+        "shared_labels": shared_labels,
         "rooms": {},
     }
+    # The structure prior and its refinements apply only to a room whose K-shot activities include the transitions.
+    with_prior = {room: settings["structure_prior"] == "transitions" and applicable(task3["exclusive"][room])
+                  for room in ROOMS}
+    refinements = {room: list(settings.get("refinements", [])) if with_prior[room] else [] for room in ROOMS}
+    representations = {room: list(ENSEMBLE) if "ensemble" in refinements[room] else [settings["representation"]]
+                       for room in ROOMS}
+    needed = {rep for reps in representations.values() for rep in reps}
+    if any("smoothing" in r for r in refinements.values()):
+        needed.add("ssl")
+
     dev = (windows.split == "development").to_numpy()
     dev_index = np.flatnonzero(dev)
-    dev_features = compute_features(bundle, np.asarray(X[dev_index]))
-    features = np.zeros((len(windows), dev_features.shape[1]), dtype=np.float32)
-    features[dev_index] = dev_features
+    X_dev = np.asarray(X[dev_index])
+    features = {}
+    for rep in sorted(needed):
+        values = compute_features(bundle, X_dev, rep)
+        features[rep] = np.zeros((len(windows), values.shape[1]), dtype=np.float32)
+        features[rep][dev_index] = values
+    del X_dev
     labels = windows.label.to_numpy()
     capture = windows.capture_id.to_numpy()
 
-    pooled = fit_stats(features[dev])
     for room in ROOMS:
         in_room = dev & (windows.room == room).to_numpy()
-        stats = fit_stats(features[in_room]) if settings["alignment"] == "per_room" else pooled
-        shared = in_room & np.isin(labels, config["labels"]["shared"])
-        support_ids = select_support(windows, room, config["task3"]["exclusive"][room], [settings["k"]],
+        other = "B" if room == "A" else "A"
+        reference = in_room if settings["alignment"] == "per_room" else dev
+        stats = {rep: fit_stats(features[rep][reference]) for rep in needed}
+
+        def aligned(mask, reps):
+            return {rep: apply_stats(features[rep][mask], stats[rep]).astype(np.float32) for rep in reps}
+
+        shared = in_room & np.isin(labels, shared_labels)
+        support_ids = select_support(windows, room, task3["exclusive"][room], [settings["k"]],
                                      config["few_shot"]["support_seed"], settings["support_draw"])[settings["k"]]
         support = in_room & np.isin(capture, support_ids)
         structure = None
-        if settings["structure_prior"] == "transitions" and applicable(config["task3"]["exclusive"][room]):
-            dev_shapes, dev_motion = structure_features(X[np.flatnonzero(in_room)], quality)
+        if with_prior[room]:
+            dev_shapes, dev_motion, dev_sway = structure_features(X[np.flatnonzero(in_room)], quality)
             sup_index = np.flatnonzero(support)
             examples = posture_examples(X[sup_index], labels[sup_index], quality, settings["structure_segment"])
             structure = {"prior": StructurePrior.fit(dev_shapes, dev_motion, examples[0], examples[1],
                                                      C=settings["logreg_C"]),
-                         "examples": examples}
+                         "examples": examples, "dev_motion": dev_motion, "dev_sway": dev_sway}
+        smoother = None
+        if "smoothing" in refinements[room]:
+            ssl_stats = fit_stats(features["ssl"][in_room])
+            n_clusters = settings["smoothing_clusters_per_class"] * len(bundle["label_sets"][room])
+            smoother = (ClusterSmoother(n_clusters, settings["smoothing_components"]).fit(
+                apply_stats(features["ssl"][in_room], ssl_stats)), ssl_stats)
         bundle["rooms"][room] = {
-            "stats": stats,
-            "dev_features": apply_stats(features[in_room], stats).astype(np.float32),
-            "shared_features": apply_stats(features[shared], stats).astype(np.float32),
+            "representations": representations[room],
+            "refinements": refinements[room],
+            "stats": {rep: stats[rep] for rep in representations[room]},
+            "dev_features": aligned(in_room, representations[room]),
+            "shared_features": aligned(shared, representations[other]),     # training data of the other room
             "shared_labels": labels[shared],
-            "support_features": apply_stats(features[support], stats).astype(np.float32),
+            "support_features": aligned(support, representations[room]),
             "support_labels": labels[support],
             "support_captures": list(support_ids),
             "structure": structure,
+            "smoother": smoother,
         }
     for room in ROOMS:
         r = bundle["rooms"][room]
-        r["model"], r["weights"] = fit_room_model(bundle, room, r["support_features"], r["support_labels"])
+        r["models"] = fit_room_models(bundle, room, r["support_features"], r["support_labels"])
+        r["cluster_means"], r["prior"] = calibrate(bundle, room, r["models"],
+                                                   r["structure"]["prior"] if r["structure"] else None)
     bundle["build_seconds"] = round(time.time() - started, 1)
     return bundle
 
@@ -223,16 +286,18 @@ def predict_windows(bundle, X, support=None):
     Returns a DataFrame with room, room_confidence, label, confidence.
     """
     rooms, room_confidence = route(bundle, X)
-    features = compute_features(bundle, X)
-    models = {room: (bundle["rooms"][room]["model"], bundle["rooms"][room]["weights"]) for room in ROOMS}
-    priors = {room: (bundle["rooms"][room].get("structure") or {}).get("prior") for room in ROOMS}
+    needed = {rep for r in bundle["rooms"].values() for rep in r["representations"]}
+    if any(r["smoother"] for r in bundle["rooms"].values()):
+        needed.add("ssl")
+    features = {rep: compute_features(bundle, X, rep) for rep in sorted(needed)}
+    systems = {room: (r["models"], r["cluster_means"], r["prior"]) for room, r in bundle["rooms"].items()}
 
     if support:
         S = np.stack([validate_window(w, "support window") for w, _, _ in support])
         s_labels = np.array([label for _, label, _ in support])
         given = [room for _, _, room in support]
         s_rooms = np.where([g in ROOMS for g in given], given, route(bundle, S)[0])
-        s_features = compute_features(bundle, S)
+        s_features = {rep: compute_features(bundle, S, rep) for rep in sorted(needed)}
         for room in ROOMS:
             mine = s_rooms == room
             if not mine.any():
@@ -242,31 +307,41 @@ def predict_windows(bundle, X, support=None):
                 raise ValueError(f"Support labels {sorted(unknown)} are not activities of Room {room}")
             r = bundle["rooms"][room]
             keep = ~np.isin(r["support_labels"], s_labels[mine])      # default support for the other labels
-            new_features = np.vstack([r["support_features"][keep], apply_stats(s_features[mine], r["stats"])])
+            new_features = {rep: np.vstack([r["support_features"][rep][keep],
+                                            apply_stats(s_features[rep][mine], r["stats"][rep])])
+                            for rep in r["representations"]}
             new_labels = np.concatenate([r["support_labels"][keep], s_labels[mine]])
-            models[room] = fit_room_model(bundle, room, new_features, new_labels)
-            if r.get("structure"):
+            models = fit_room_models(bundle, room, new_features, new_labels)
+            prior = None
+            if r["structure"]:
                 shapes, ex_labels, sources = r["structure"]["examples"]
                 new = posture_examples(S[mine], s_labels[mine], bundle["quality"],
                                        bundle["settings"]["structure_segment"])
                 kept = ~np.isin(sources, s_labels[mine])                    # default examples of other labels
                 all_labels = np.concatenate([ex_labels[kept], new[1]])
-                priors[room] = (r["structure"]["prior"].refit(np.vstack([shapes[kept], new[0]]), all_labels,
-                                                               bundle["settings"]["logreg_C"])
-                                if {"SIT", "STAND"} <= set(all_labels) else None)
+                if {"SIT", "STAND"} <= set(all_labels):
+                    prior = r["structure"]["prior"].refit(np.vstack([shapes[kept], new[0]]), all_labels,
+                                                          bundle["settings"]["logreg_C"])
+            systems[room] = (models, *calibrate(bundle, room, models, prior))
 
     label = np.empty(len(X), dtype=object)
     confidence = np.zeros(len(X))
     for room in ROOMS:
         mine = rooms == room
-        if mine.any():
-            model, weights = models[room]
-            label[mine], confidence[mine] = predict(model, apply_stats(features[mine], bundle["rooms"][room]["stats"]),
-                                                    weights)
-            if priors[room] is not None:
-                shapes, motion = structure_features(X[mine], bundle["quality"])
-                label[mine], confidence[mine] = priors[room].revise(shapes, motion, label[mine], confidence[mine],
-                                                                    bundle["shared_labels"])
+        if not mine.any():
+            continue
+        r = bundle["rooms"][room]
+        models, means, prior = systems[room]
+        P = room_proba(models, {rep: apply_stats(features[rep][mine], r["stats"][rep]) for rep in r["representations"]})
+        if means is not None:
+            smoother, stats = r["smoother"]
+            P = smoother.smooth(P, smoother.assign(apply_stats(features["ssl"][mine], stats)), means)
+        classes = next(iter(models.values()))[0].classes_
+        label[mine], confidence[mine] = classes[P.argmax(axis=1)], P.max(axis=1)
+        if prior is not None:
+            shapes, motion, sway = structure_features(X[mine], bundle["quality"])
+            label[mine], confidence[mine] = prior.revise(shapes, motion, label[mine], confidence[mine],
+                                                         bundle["shared_labels"], sway)
     return pd.DataFrame({"room": rooms, "room_confidence": room_confidence.round(4),
                          "label": label, "confidence": confidence.round(4)})
 

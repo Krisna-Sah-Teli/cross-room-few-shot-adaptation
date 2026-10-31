@@ -5,10 +5,17 @@
     "head": "logreg",
     "balancing": "uniform",
     "structure_prior": "transitions",
+    "refinements": [
+      "sway",
+      "ensemble",
+      "smoothing"
+    ],
     "k": 20,
     "support_draw": 0,
     "logreg_C": 0.1,
-    "structure_segment": 0.3
+    "structure_segment": 0.3,
+    "smoothing_clusters_per_class": 3,
+    "smoothing_components": 32
   },
   "preprocessing_id": "8fcdd9246c",
   "label_sets": {
@@ -137,5 +144,13 @@
   "structure_prior_rooms": [
     "A"
   ],
-  "build_seconds": 5.8
+  "refinements": {
+    "A": [
+      "sway",
+      "ensemble",
+      "smoothing"
+    ],
+    "B": []
+  },
+  "build_seconds": 12.5
 }
