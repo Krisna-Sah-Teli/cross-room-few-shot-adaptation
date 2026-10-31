@@ -167,7 +167,7 @@ Open the project notebook and run the cells in order.
 
 - [x] Task 1: Room-identification baseline
 - [x] Task 1: Window-length evaluation
-- [ ] Task 2: Self-supervised learning
+- [x] Task 2: Self-supervised learning
 - [ ] Task 3: Cross-room few-shot adaptation
 
 ## Acknowledgements
