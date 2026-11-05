@@ -223,6 +223,8 @@ Shared activities: SIT, STAND, WALK. Room-specific activities are learned from K
 - **Room vs session:** the rooms were recorded in separate sessions with different packet configurations; room identification may reflect session as well as environment.
 - **Activity vs location:** Room A activities were recorded in partly different spatial zones.
 - **Two rooms only;** no claim about unseen rooms. **Capture-disjoint, not subject-disjoint.**
+- **Not comparable with the original paper:** the paper evaluates a random 80/20 split within its experiments; this benchmark keeps whole captures apart and transfers across rooms, so its scores answer a different question and cannot be compared with the paper's.
+- **Asymmetric source archives:** Room A starts as raw PCAP, decoded by our own Python, while Room B arrives already as amplitude CSV from an export we cannot inspect. Both are brought into the same 256-column amplitude form, but differences in how the amplitudes were produced remain part of the room/session difference.
 - **Window-level metrics:** Room B validation has 3 windows per capture, so its 375 windows are not independent.
 - **Room B data:** consecutive observations behave like independent noisy samples (no temporal coherence, values capped at 2,047, origin of the export unknown), which limits cross-room transfer of shared activities.
 - **Room-structure prior:** it relies on two assumptions about the target room — walking is its only strongly fluctuating activity, and transition captures start and end in the stated postures. Both hold for Room A; the prior is not applicable to Room B. Its design, the refinements and the choice to use them only where the prior applies were compared on the validation set, so their gains are validation results.
