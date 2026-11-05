@@ -14,7 +14,7 @@ from scripts.room_a_pcap import (
     decode_bcm4366c0_batch, decode_bcm4366c0_words, list_pcap_members,
     read_room_a_capture_qc,
 )
-from scripts.window_extraction import centered_tiling_starts
+from scripts.window_extraction import centered_tiling_starts, window_starts
 
 CONFIG = load_config()
 
@@ -72,6 +72,13 @@ def test_centered_tiling():
     assert centered_tiling_starts(150) == [0]
     assert centered_tiling_starts(216) == [33]
     assert centered_tiling_starts(500) == [25, 175, 325]
+    assert window_starts(500, CONFIG["window"]) == [25, 175, 325]     # the configured policy
+    try:
+        window_starts(500, {"policy": "sliding", "length": 150})
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("an unknown window policy must be rejected")
 
 
 if __name__ == "__main__":

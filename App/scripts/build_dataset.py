@@ -32,7 +32,7 @@ from scripts.config import PROJECT_ROOT, load_config, preprocessing_fingerprint
 from scripts.csi_quality import BAND_CLASSES, band_counts, classify_band_coverage, consecutive_duplicate_mask
 from scripts.room_a_pcap import list_pcap_members, read_room_a_capture_qc
 from scripts.room_b_split import create_room_b_split
-from scripts.window_extraction import centered_tiling_starts
+from scripts.window_extraction import window_starts
 
 COMMON_COLUMNS = [f"subcarrier_{i:03d}" for i in range(1, 257)]
 ROOM_A_ACTIVITIES = {"fall", "sit", "sitdown", "stand", "standup", "walk"}
@@ -160,7 +160,7 @@ def build_windows(captures, config, fingerprint):
             continue
         amplitude = pd.read_csv(PROJECT_ROOT / capture.intermediate_csv).to_numpy(dtype=np.float32)
         assert amplitude.shape[1] == 256 and np.isfinite(amplitude).all()
-        for window_index, start in enumerate(centered_tiling_starts(len(amplitude), length)):
+        for window_index, start in enumerate(window_starts(len(amplitude), config["window"])):
             window = amplitude[start:start + length]
             tensors.append(window)
             rows.append({

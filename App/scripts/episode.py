@@ -45,7 +45,7 @@ from scripts.room_a_pcap import read_room_a_capture_qc
 from scripts.room_fingerprint import normalize, window_features
 from scripts.room_structure import StructurePrior, applicable, posture_examples, structure_features
 from scripts.ssl_encoder import CSIEncoder, embed, prepare_input
-from scripts.window_extraction import centered_tiling_starts
+from scripts.window_extraction import centered_tiling_starts, window_starts
 
 ROOMS = ("A", "B")
 ENSEMBLE = ("ssl", "handcrafted")
@@ -101,7 +101,7 @@ def windows_from_capture(path, config):
     """Raw capture -> list of (window_id, (150, 256) window), with the dataset-build preprocessing."""
     amplitude, length = capture_amplitude(path, config), config["window"]["length"]
     return [(f"{Path(path).stem}_w{i}", amplitude[start:start + length])
-            for i, start in enumerate(centered_tiling_starts(len(amplitude), length))]
+            for i, start in enumerate(window_starts(len(amplitude), config["window"]))]
 
 
 def padded_window(rows, length):
