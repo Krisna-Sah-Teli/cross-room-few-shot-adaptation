@@ -122,10 +122,12 @@ python run_episode.py EPISODE_DIR [--output FILE] [--rebuild-model]
 |---|---|
 | `window_XXXX.npy` | one window: shape (150, 256), float32, CSI amplitude (the model-input contract, §10) |
 | `*.pcap`, `*.csv` | raw captures (Room A Nexmon PCAP format, or 256 amplitude columns); they go through exactly the dataset-build preprocessing and become windows `<file>_w0`, `<file>_w1`, ... |
-| `support.csv` (optional) | few-shot support for the target room: columns `window_file,label[,room]`. For each label it contains, it replaces the default support |
+| `support.csv` (optional) | few-shot support for the target room: columns `window_file,label[,room]`; `window_file` is a window (`.npy`) or a raw capture (`.pcap`/`.csv`, all its windows get the label). For each label it contains, it replaces the default support. Files listed here are not labelled as inputs |
 | `labels.csv` (optional) | ground truth `window_id,label[,room]`; only used to print scores |
 
 Output: `predictions.csv` with columns `window_id, room, label, confidence`, plus `predictions_details.csv` with the router confidence and the input file of each window.
+
+Robustness for unseen episodes: labels may be written as in the brief or the archive (`SIT-DOWN`, `Stand up`, `Sitting`, ...); a capture or window with fewer than 150 valid observations still gets a prediction, from its own observations repeated in order (marked "padded" in `predictions_details.csv`); a file that is not a readable CSI capture is skipped with a note instead of stopping the run.
 
 Each window is routed to a room by the Task 1 router, then classified by that room's Task 3 model (shared activities learned from the other room; target-exclusive activities from K = 20 support captures per activity, the official seed-42 draw 0). For windows routed to Room A, the SSL and handcrafted models' probabilities are averaged and smoothed over clusters of Room A's unlabelled development windows, and the room-structure prior (with the sway vote) revises the shared activities. File names, folders and capture lengths are never used as features. On the full validation set, `run_episode.py` reproduces the reported Task 3 predictions exactly (tested).
 

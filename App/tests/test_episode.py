@@ -11,8 +11,8 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from scripts.config import PROJECT_ROOT, load_config
-from scripts.episode import (build_bundle, load_bundle, load_episode_inputs, predict_windows, save_bundle,
-                             windows_from_capture)
+from scripts.episode import (build_bundle, load_bundle, load_episode_inputs, normalize_label, predict_windows,
+                             read_support, save_bundle, windows_from_capture)
 
 CONFIG = load_config()
 WINDOWS = pd.read_csv(CONFIG["paths"]["data_dir"] / "windows_manifest.csv")
@@ -81,6 +81,32 @@ def test_episode_support_replaces_default_support():
         pass
     else:
         raise AssertionError("an invalid support label must be rejected")
+
+
+def test_episode_inputs_are_robust():
+    """Label spellings of the brief and archive, a raw capture as support, a stray CSV and a short capture."""
+    val = VAL[VAL.room == "A"].head(3)
+    sitdown = WINDOWS[(WINDOWS.split == "development") & (WINDOWS.room == "A") & (WINDOWS.label == "SITDOWN")].head(2)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        for i, path in enumerate(val.window_file, start=1):
+            np.save(tmp / f"window_{i:04d}.npy", np.load(PROJECT_ROOT / path))
+        for i, path in enumerate(sitdown.window_file, start=1):
+            np.save(tmp / f"support_{i}.npy", np.load(PROJECT_ROOT / path))
+        short = pd.DataFrame(np.load(PROJECT_ROOT / val.window_file.iloc[0])[:100])
+        short.to_csv(tmp / "short_capture.csv", index=False)               # 100 observations: padded
+        short.to_csv(tmp / "support_capture.csv", index=False)
+        pd.DataFrame({"window_file": ["support_1.npy", "support_2.npy", "support_capture.csv"],
+                      "label": ["SIT-DOWN", "Sit down", "Lying"], "room": ["A", "A", "B"]}).to_csv(
+            tmp / "support.csv", index=False)
+        (tmp / "notes.csv").write_text("comment,value\nrecorded by,team\n")   # not CSI: skipped
+        ids, X, sources = load_episode_inputs(tmp, CONFIG)
+        support = read_support(tmp, CONFIG)
+    assert ids == ["window_0001", "window_0002", "window_0003", "short_capture_w0"]   # support files not labelled
+    assert X.shape == (4, 150, 256) and "padded from 100" in sources[-1]
+    assert [label for _, label, _ in support] == ["SITDOWN", "SITDOWN", "LYING"]
+    assert len(predict_windows(BUNDLE, X, support)) == 4
+    assert normalize_label("STAND-UP") == "STANDUP" and normalize_label("Sitting") == "SIT"
 
 
 if __name__ == "__main__":

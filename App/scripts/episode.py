@@ -6,10 +6,15 @@ An episode is a folder of inputs to label:
     columns, Room B format). Raw captures go through the same preprocessing as the
     dataset build: decoding, quality control and centred 150-observation windows.
 Optional files in the folder:
-  - support.csv: labelled target-room windows (columns window_file,label[,room]) for
-    few-shot adaptation. For every label it contains, it replaces the default support
-    (development captures) of that room.
+  - support.csv: labelled target-room examples (columns window_file,label[,room]) for
+    few-shot adaptation; window_file is a window (.npy) or a raw capture (.pcap/.csv), whose
+    windows all get the label. For every label it contains, it replaces the default support
+    (development captures) of that room. Files listed here are not labelled as inputs.
   - labels.csv: ground truth (columns window_id,label[,room]) used only to print scores.
+Labels may be written as in the brief or the archive (SIT-DOWN, Sitting, ...). Every input gets
+a prediction: a capture or window with fewer than 150 valid observations is completed by
+repeating its own observations in order (marked "padded" in predictions_details.csv), and a
+file that is not a readable capture is skipped with a note instead of stopping the run.
 
 Each window is routed to a room by the Task 1 router and classified by that room's Task 3
 model: shared activities learned from the other room's development windows, target-exclusive
@@ -23,6 +28,7 @@ subcarriers.
 """
 
 import pickle
+import re
 import time
 from pathlib import Path
 
@@ -44,9 +50,18 @@ from scripts.window_extraction import centered_tiling_starts
 ROOMS = ("A", "B")
 ENSEMBLE = ("ssl", "handcrafted")
 RESERVED_FILES = {"support.csv", "labels.csv", "predictions.csv", "predictions_details.csv"}
+# Activity words of the brief and the archive -> label names (after removing case, spaces, '-' and '_').
+LABEL_ALIASES = {"SITTING": "SIT", "STANDING": "STAND", "WALKING": "WALK", "FALLING": "FALL", "LAYING": "LYING",
+                 "LYINGDOWN": "LYING", "SITTINGDOWN": "SITDOWN", "STANDINGUP": "STANDUP", "EMPTYROOM": "EMPTY"}
 
 
 # ------------------------------------------------------------------ inputs
+
+def normalize_label(label):
+    """Canonical activity name: SIT-DOWN, Sit down and sit_down -> SITDOWN; Sitting -> SIT."""
+    key = re.sub(r"[\s_\-]", "", str(label).upper())
+    return LABEL_ALIASES.get(key, key)
+
 
 def validate_window(array, name):
     array = np.asarray(array, dtype=np.float32)
@@ -57,8 +72,8 @@ def validate_window(array, name):
     return array
 
 
-def windows_from_capture(path, config):
-    """Raw capture -> list of (window_id, (150, 256) window), with the dataset-build preprocessing."""
+def capture_amplitude(path, config):
+    """Raw capture -> its valid observations (n, 256), with the dataset-build decoding and quality control."""
     path = Path(path)
     quality = config["quality"]
     if path.suffix.lower() == ".pcap":
@@ -79,30 +94,82 @@ def windows_from_capture(path, config):
         if quality["drop_consecutive_duplicates"]:
             values = values[~consecutive_duplicate_mask(values)]
         amplitude = values
-    amplitude = amplitude[classify_band_coverage(amplitude, quality) != "empty"].astype(np.float32)
-    length = config["window"]["length"]
-    return [(f"{path.stem}_w{i}", amplitude[start:start + length])
+    return amplitude[classify_band_coverage(amplitude, quality) != "empty"].astype(np.float32)
+
+
+def windows_from_capture(path, config):
+    """Raw capture -> list of (window_id, (150, 256) window), with the dataset-build preprocessing."""
+    amplitude, length = capture_amplitude(path, config), config["window"]["length"]
+    return [(f"{Path(path).stem}_w{i}", amplitude[start:start + length])
             for i, start in enumerate(centered_tiling_starts(len(amplitude), length))]
 
 
+def padded_window(rows, length):
+    """One window from fewer than `length` observations of one capture: its own observations repeated in order."""
+    return np.resize(np.asarray(rows, dtype=np.float32), (length, rows.shape[1]))
+
+
+def windows_from_file(path, config):
+    """(window_id, window, note) for an episode file: a window (.npy) or a raw capture (.pcap/.csv).
+
+    A file with fewer than 150 valid observations gives one padded window; a .npy with more than
+    150 rows gives its centred 150. Raises ValueError for a file that is not 256-column CSI amplitude.
+    """
+    path, length = Path(path), config["window"]["length"]
+    if path.suffix.lower() == ".npy":
+        rows, window_id = np.asarray(np.load(path), dtype=np.float32), path.stem
+        if rows.ndim != 2 or rows.shape[1] != 256 or len(rows) == 0:
+            raise ValueError(f"expected a (150, 256) window, got shape {rows.shape}")
+        if len(rows) > length:
+            start = centered_tiling_starts(len(rows), length)[0]
+            return [(window_id, validate_window(rows[start:start + length], path.name), "")]
+        if len(rows) < length:
+            return [(window_id, validate_window(padded_window(rows, length), path.name), f"padded from {len(rows)}")]
+        return [(window_id, validate_window(rows, path.name), "")]
+    produced = [(window_id, validate_window(window, window_id), "") for window_id, window in
+                windows_from_capture(path, config)]
+    if produced:
+        return produced
+    rows = capture_amplitude(path, config)
+    if len(rows) == 0:
+        raise ValueError("no valid CSI observation")
+    return [(f"{path.stem}_w0", validate_window(padded_window(rows, length), path.stem),
+             f"padded from {len(rows)}")]
+
+
+def support_files(folder):
+    """Names of the files that support.csv uses as labelled examples (they are not inputs to label)."""
+    path = Path(folder) / "support.csv"
+    if not path.is_file():
+        return set()
+    table = pd.read_csv(path)
+    return {Path(str(name)).name.lower() for name in table.get("window_file", [])}
+
+
 def load_episode_inputs(folder, config):
-    """Collect every window of an episode folder: window files first, then raw captures."""
+    """Collect every window of an episode folder: window files first, then raw captures.
+
+    Returns (window ids, windows (n, 150, 256), the input file of each window, with a padding note).
+    """
     folder = Path(folder)
+    skip = RESERVED_FILES | support_files(folder)
+    inputs = sorted(p for p in folder.glob("*.npy") if p.name.lower() not in skip)
+    inputs += sorted(p for p in folder.iterdir()
+                     if p.suffix.lower() in (".pcap", ".csv") and p.name.lower() not in skip)
     ids, windows, sources = [], [], []
-    for path in sorted(folder.glob("*.npy")):
-        ids.append(path.stem)
-        windows.append(validate_window(np.load(path), path.name))
-        sources.append(path.name)
-    raw = sorted(p for p in folder.iterdir()
-                 if p.suffix.lower() in (".pcap", ".csv") and p.name.lower() not in RESERVED_FILES)
-    for path in raw:
-        produced = windows_from_capture(path, config)
-        if not produced:
-            print(f"  note: {path.name} has fewer than {config['window']['length']} valid observations; no window")
-        for window_id, window in produced:
+    for path in inputs:
+        try:
+            produced = windows_from_file(path, config)
+        except Exception as error:           # one unreadable file must not stop the whole episode
+            print(f"  note: skipped {path.name}: not a readable CSI window or capture ({error})")
+            continue
+        for window_id, window, note in produced:
+            if note:
+                print(f"  note: {path.name} has fewer than {config['window']['length']} valid observations; "
+                      f"{note} by repeating them")
             ids.append(window_id)
-            windows.append(validate_window(window, window_id))
-            sources.append(path.name)
+            windows.append(window)
+            sources.append(f"{path.name} ({note})" if note else path.name)
     if not windows:
         raise FileNotFoundError(f"No window_*.npy files or raw captures (.pcap/.csv) found in {folder}")
     if len(set(ids)) != len(ids):
@@ -346,20 +413,28 @@ def predict_windows(bundle, X, support=None):
                          "label": label, "confidence": confidence.round(4)})
 
 
-def read_support(folder):
-    """support.csv -> list of (window, label, room or None)."""
+def read_support(folder, config):
+    """support.csv -> list of (window, label, room or None); a raw capture contributes all its windows."""
     folder = Path(folder)
     table = pd.read_csv(folder / "support.csv")
     missing = {"window_file", "label"} - set(table.columns)
     if missing:
         raise ValueError(f"support.csv is missing columns {sorted(missing)}")
-    return [(np.load(folder / row.window_file), str(row.label).upper(),
-             str(getattr(row, "room", "")).upper() or None) for row in table.itertuples()]
+    support = []
+    for row in table.itertuples():
+        room = str(getattr(row, "room", "")).strip().upper()
+        for _, window, _ in windows_from_file(folder / str(row.window_file), config):
+            support.append((window, normalize_label(row.label), room if room in ROOMS else None))
+    return support
 
 
 def score_predictions(predictions, labels_file):
     """Print accuracy and macro-F1 against an episode's labels.csv."""
     truth = pd.read_csv(labels_file)
+    truth["window_id"] = truth.window_id.astype(str)
+    truth["label"] = truth.label.map(normalize_label)
+    if "room" in truth:
+        truth["room"] = truth.room.astype(str).str.strip().str.upper()
     merged = predictions.merge(truth, on="window_id", suffixes=("", "_true"))
     if merged.empty:
         print("labels.csv has no window_id in common with the predictions")

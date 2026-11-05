@@ -6,7 +6,8 @@ Usage:
 EPISODE_DIR contains window_XXXX.npy files (150 x 256 float32 CSI amplitude) and/or raw
 captures (*.pcap in the Room A Nexmon format, *.csv with 256 amplitude columns in the
 Room B format). Optional files:
-    support.csv   few-shot support for the target room (columns window_file,label[,room])
+    support.csv   few-shot support for the target room (columns window_file,label[,room]; window_file is
+                  a window .npy or a raw .pcap/.csv capture)
     labels.csv    ground truth (columns window_id,label[,room]); scores are printed
 Writes predictions.csv (window_id, room, label, confidence) into EPISODE_DIR, and
 predictions_details.csv with the router confidence and the input file of each window.
@@ -52,7 +53,7 @@ def main():
     bundle = load_bundle(bundle_path)
 
     ids, X, sources = load_episode_inputs(episode, config)
-    support = read_support(episode) if (episode / "support.csv").is_file() else None
+    support = read_support(episode, config) if (episode / "support.csv").is_file() else None
     print(f"Episode {episode}: {len(ids)} windows from {len(set(sources))} input file(s)"
           + (f", {len(support)} support windows" if support else ""))
 
