@@ -1,7 +1,9 @@
 """Task 3: cross-room few-shot adaptation (A -> B and B -> A, K = 1, 5, 10, 20).
 
 Grid (all evaluated on the fixed target validation windows, oracle routing):
-  representation  ssl (Task 2 encoder) or handcrafted features, both on all 256 subcarriers
+  representation  ssl (Task 2 encoder), handcrafted features, or random - the same encoder
+                  architecture with random weights, a baseline that measures what SSL pretraining
+                  contributes and is never selected (representation_effect.csv); all on 256 subcarriers
   alignment       pooled  - one standardization fitted on development windows of both rooms
                   per_room - each room standardized with its own development statistics
   head            logreg (balanced logistic regression) or prototype (nearest class mean)
@@ -49,22 +51,25 @@ from scripts.few_shot_adaptation import (ClusterSmoother, apply_stats, balanced_
                                          make_head, predict, score, select_support)
 from scripts.room_fingerprint import window_features
 from scripts.room_structure import StructurePrior, applicable, posture_examples, structure_features
-from scripts.ssl_encoder import CSIEncoder, embed, prepare_input
+from scripts.ssl_encoder import CSIEncoder, embed, prepare_input, random_encoder
 
 DIRECTIONS = [("A", "B"), ("B", "A")]
 METRICS = ["primary_macro_f1", "exclusive_macro_f1", "shared_macro_f1", "balanced_accuracy", "accuracy"]
 ENSEMBLE = ("ssl", "handcrafted")
+BASELINES = ("random",)                 # compared in the grid, never selected as the reported configuration
 # Row order of the per-activity K = 5 table, one column block per target room.
 TABLE_ROWS = {"A": ["SIT", "STAND", "WALK", "SITDOWN", "STANDUP", "FALL"], "B": ["EMPTY", "LYING", "SIT", "STAND", "WALK"]}
 
 
 def build_representations(X, config, task2_dir):
-    """SSL embeddings (frozen Task 2 encoder) and handcrafted features of every window."""
+    """SSL embeddings (frozen Task 2 encoder), handcrafted features and the embeddings of the same encoder
+    architecture with random weights (the Task 2 baseline) of every window."""
     inputs = prepare_input(X)
     checkpoint = torch.load(task2_dir / "encoder.pt", weights_only=False)
     encoder = CSIEncoder(checkpoint["in_channels"])
     encoder.load_state_dict(checkpoint["state_dict"])
-    reps = {"ssl": embed(encoder, inputs), "handcrafted": window_features(inputs)}
+    reps = {"ssl": embed(encoder, inputs), "handcrafted": window_features(inputs),
+            "random": embed(random_encoder(checkpoint["in_channels"], config["ssl"]["seed"]), inputs)}
     print("  representations ready (256 subcarriers)", flush=True)
     return reps
 
@@ -321,7 +326,8 @@ def write_per_class_table(confusions, exclusive, out_dir):
 
 def make_figures(out_dir, windows, config):
     """Draw every Task 3 figure, and the per-activity K = 5 table, from the saved result files."""
-    ranking = pd.read_csv(out_dir / "grid_ranking.csv").iloc[0]
+    ranking = pd.read_csv(out_dir / "grid_ranking.csv")
+    ranking = ranking[~ranking.representation.isin(BASELINES)].iloc[0]
     label = f"{ranking.representation}, {ranking.alignment} alignment, {ranking['head']} head"
     if "balancing" in ranking:
         label += f", {ranking.balancing} balancing"
@@ -457,9 +463,20 @@ def main():
     grid_summary.to_csv(out_dir / "grid_summary.csv", index=False)
     overall = grid.groupby(config_keys)["primary_macro_f1"].mean().sort_values(ascending=False)
     overall.rename("mean_primary_macro_f1").reset_index().to_csv(out_dir / "grid_ranking.csv", index=False)
-    best_rep, best_align, best_head, best_balancing, best_prior = overall.index[0]
+    candidates = overall[~overall.index.get_level_values("representation").isin(BASELINES)]
+    best_rep, best_align, best_head, best_balancing, best_prior = candidates.index[0]
     print(f"\nBest configuration on validation: {best_rep} / {best_align} / {best_head} / {best_balancing} balancing"
-          f" / {best_prior} structure prior (mean primary macro-F1 {overall.iloc[0]:.4f})", flush=True)
+          f" / {best_prior} structure prior (mean primary macro-F1 {candidates.iloc[0]:.4f})", flush=True)
+
+    # What SSL pretraining contributes: every representation with the best alignment, head, balancing and prior.
+    same_settings = grid[(grid.alignment == best_align) & (grid["head"] == best_head)
+                         & (grid.balancing == best_balancing) & (grid.structure_prior == best_prior)]
+    effect = same_settings.groupby(["target_room", "K", "representation"])[
+        ["primary_macro_f1", "exclusive_macro_f1", "shared_macro_f1"]].mean().unstack("representation").round(4)
+    effect.to_csv(out_dir / "representation_effect.csv")
+    print("\nRepresentations with the best settings (mean primary macro-F1 over K and draws):")
+    print(same_settings.groupby(["target_room", "representation"]).primary_macro_f1.mean().unstack("target_room")
+          .round(4).to_string())
 
     # Effect of balancing and of the structure prior for the best representation, alignment and head.
     same_model = grid[(grid.representation == best_rep) & (grid.alignment == best_align) & (grid["head"] == best_head)]
