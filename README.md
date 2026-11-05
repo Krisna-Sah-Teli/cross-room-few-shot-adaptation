@@ -44,6 +44,17 @@ Window-length study (headline): 98.9% with 1 observation, 99.8% with 2, 100% fro
 
 Ablations (mean primary macro-F1 over both directions and all K): plain adaptation 0.364 → + class balancing 0.392 → + room-structure prior 0.464 → + refinements where the prior applies **0.497**. For target Room A the prior lifts the shared activities from ≈0.19 to ≈0.50 (`structure_prior_effect.csv`); it does not apply to target Room B. The refinements, added one at a time, lift target Room A from 0.554 to 0.570 (sway), 0.605 (+ ensemble) and 0.620 (+ smoothing); on target Room B the ensemble and smoothing would lower it (0.374 → 0.329 → 0.305), so they are used only with the prior (`refinement_effect.csv`). Routing contribution at K = 20: target A 0.330 without routing vs 0.696 with predicted-room routing; target B 0.229 vs 0.461 (predicted and oracle routing coincide: the router is 100% correct on validation).
 
+Per activity at K = 5 for support draw 0, the official seed-42 support set used in `fig_confusion_K5.png` (`task3/table_per_class_K5.md`; LaTeX version for the report: `table_per_class_K5.tex`). \* marks the target-exclusive K-shot activities. This draw's primary macro-F1 is 0.622 for target Room A and 0.403 for target Room B; the table above averages five draws (0.668 and 0.388).
+
+| Target Room A | P | R | F1 | Target Room B | P | R | F1 |
+|---|---:|---:|---:|---|---:|---:|---:|
+| SIT | 0.636 | 0.609 | 0.622 | EMPTY\* | 0.709 | 0.747 | 0.727 |
+| STAND | 0.529 | 0.360 | 0.429 | LYING\* | 0.639 | 0.613 | 0.626 |
+| WALK | 0.686 | 1.000 | 0.814 | SIT | 0.041 | 0.040 | 0.041 |
+| SITDOWN\* | 0.643 | 0.720 | 0.679 | STAND | 0.236 | 0.280 | 0.256 |
+| STANDUP\* | 0.500 | 0.480 | 0.490 | WALK | 0.403 | 0.333 | 0.365 |
+| FALL\* | 0.762 | 0.640 | 0.696 |  |  |  |  |
+
 **Main findings**
 - About 70% of Room A observations are 20 MHz frames that fill only the lowest 20 MHz block (subcarriers 134–186); Room B is almost always full 80 MHz. This recording-configuration difference alone identifies the room (99.6%). With packet types matched, the rooms remain separable (100%), but room and recording session cannot be disentangled (§12).
 - Target-exclusive activities are learned well from few labelled captures and improve steadily with K.
@@ -87,7 +98,7 @@ python App/scripts/task3_cross_room.py            # ~10 min: Task 3 grid, routin
 python App/scripts/build_final_model.py           # seconds: the deployed system for run_episode.py
 ```
 
-Every random choice is seeded; re-running reproduces the reported numbers exactly. `python App/scripts/task3_cross_room.py --replot` redraws the Task 3 figures from saved results.
+Every random choice is seeded; re-running reproduces the reported numbers exactly. `python App/scripts/task3_cross_room.py --replot` redraws the Task 3 figures and the per-activity K = 5 table from saved results.
 
 ### 4. Tests
 
@@ -187,7 +198,7 @@ Design notes:
 │   ├── main_notebook.ipynb            exploration notebook: file inspection, decoder audits, first experiments
 │   └── results/
 │       ├── data/                      manifests, QC report, preprocessing settings (tensors not tracked)
-│       ├── task1/, task2/, task3/     metrics.csv, predictions, figures, trained router and encoder
+│       ├── task1/, task2/, task3/     metrics.csv, predictions, figures, tables, trained router and encoder
 │       └── final_model/               bundle.pkl used by run_episode.py
 ├── Source_Data/                       challenge archives (not tracked)
 ├── Intermediate_CSV/                  generated (not tracked)
