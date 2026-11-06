@@ -1,0 +1,98 @@
+
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ==============================
+# Jupyter Notebook
+# ==============================
+.ipynb_checkpoints/
+
+# ==============================
+# IDE and operating system
+# ==============================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# Secrets and environment files
+# ==============================
+.env
+.env.*
+!.env.example
+
+# ==============================
+# Logs and temporary files
+# ==============================
+*.log
+*.tmp
+*.temp
+~$*
+
+# ==============================
+# Source data archives
+# Keep Source_Data directory structure,
+# but do not track experiment ZIP files.
+# ==============================
+Source_Data/*.zip
+Source_Data/*.ZIP
+/*.zip
+/*.ZIP
+
+# ==============================
+# Derived data (all regenerated from Source_Data by App/scripts/build_dataset.py)
+# Folder names are matched exactly, as on case-sensitive systems (Linux, macOS).
+# ==============================
+Intermediate_CSV/
+Windows/
+Episodes/
+*.npy
+App/results/data/room_a_observations.csv
+
+# ==============================
+# Results: keep the pipeline's metrics, predictions, figures, manifests and
+# trained models; ignore the exploration notebook's own output files.
+# ==============================
+App/results/*
+!App/results/.gitkeep
+!App/results/data/
+!App/results/task1/
+!App/results/task2/
+!App/results/task3/
+!App/results/final_model/
+
+# ==============================
+# Generated model artifacts (only the pipeline's trained models are kept)
+# ==============================
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.onnx
+!App/results/task1/room_router.pkl
+!App/results/task2/encoder.pt
+!App/results/final_model/bundle.pkl
+
+# ==============================
+# OS-generated archives / backups
+# ==============================
+*.bak
+
+# Local copies of the challenge specification (not part of the repository)
+hackathon2_cross_room_few_shot_csi.md
+CS60055_Challenge2.pdf

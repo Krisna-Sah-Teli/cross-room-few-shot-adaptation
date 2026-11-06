@@ -1,0 +1,452 @@
+"""End-to-end inference for a challenge episode (used by run_episode.py).
+
+An episode is a folder of inputs to label:
+  - window files: window_*.npy, each a (150, 256) float32 CSI-amplitude window, and/or
+  - raw captures: *.pcap (Nexmon BCM4366c0, Room A format) or *.csv (256 amplitude
+    columns, Room B format). Raw captures go through the same preprocessing as the
+    dataset build: decoding, quality control and centred 150-observation windows.
+Optional files in the folder:
+  - support.csv: labelled target-room examples (columns window_file,label[,room]) for
+    few-shot adaptation; window_file is a window (.npy) or a raw capture (.pcap/.csv), whose
+    windows all get the label. For every label it contains, it replaces the default support
+    (development captures) of that room. Files listed here are not labelled as inputs.
+  - labels.csv: ground truth (columns window_id,label[,room]) used only to print scores.
+Labels may be written as in the brief or the archive (SIT-DOWN, Sitting, ...). Every input gets
+a prediction: a capture or window with fewer than 150 valid observations is completed by
+repeating its own observations in order (marked "padded" in predictions_details.csv), and a
+file that is not a readable capture is skipped with a note instead of stopping the run.
+
+Each window is routed to a room by the Task 1 router and classified by that room's Task 3
+model: shared activities learned from the other room's development windows, target-exclusive
+activities from the support set, with per-room alignment and class balancing computed on
+unlabelled development windows. For a room whose K-shot activities include SITDOWN and
+STANDUP (Room A), the shared activities are then revised by the room-structure prior
+(room_structure.py), with the refinements of `final_model`: the SSL and handcrafted models'
+probabilities are averaged, smoothed over k-means clusters of the room's unlabelled
+development windows, and postural sway votes on SIT vs STAND. All inputs use the full 256
+subcarriers.
+"""
+
+import pickle
+import re
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, f1_score
+
+from scripts.config import preprocessing_fingerprint
+from scripts.csi_quality import classify_band_coverage, consecutive_duplicate_mask
+from scripts.few_shot_adaptation import (ClusterSmoother, apply_stats, balanced_proba, balancing_weights, fit_stats,
+                                         make_head, select_support)
+from scripts.room_a_pcap import read_room_a_capture_qc
+from scripts.room_fingerprint import normalize, window_features
+from scripts.room_structure import StructurePrior, applicable, posture_examples, structure_features
+from scripts.ssl_encoder import CSIEncoder, embed, prepare_input
+from scripts.window_extraction import centered_tiling_starts, window_starts
+
+ROOMS = ("A", "B")
+ENSEMBLE = ("ssl", "handcrafted")
+RESERVED_FILES = {"support.csv", "labels.csv", "predictions.csv", "predictions_details.csv"}
+# Activity words of the brief and the archive -> label names (after removing case, spaces, '-' and '_').
+LABEL_ALIASES = {"SITTING": "SIT", "STANDING": "STAND", "WALKING": "WALK", "FALLING": "FALL", "LAYING": "LYING",
+                 "LYINGDOWN": "LYING", "SITTINGDOWN": "SITDOWN", "STANDINGUP": "STANDUP", "EMPTYROOM": "EMPTY"}
+
+
+# ------------------------------------------------------------------ inputs
+
+def normalize_label(label):
+    """Canonical activity name: SIT-DOWN, Sit down and sit_down -> SITDOWN; Sitting -> SIT."""
+    key = re.sub(r"[\s_\-]", "", str(label).upper())
+    return LABEL_ALIASES.get(key, key)
+
+
+def validate_window(array, name):
+    array = np.asarray(array, dtype=np.float32)
+    if array.shape != (150, 256):
+        raise ValueError(f"{name}: expected shape (150, 256), got {array.shape}")
+    if not np.isfinite(array).all() or (array < 0).any():
+        raise ValueError(f"{name}: amplitudes must be finite and non-negative")
+    return array
+
+
+def capture_amplitude(path, config):
+    """Raw capture -> its valid observations (n, 256), with the dataset-build decoding and quality control."""
+    path = Path(path)
+    quality = config["quality"]
+    if path.suffix.lower() == ".pcap":
+        capture = read_room_a_capture_qc(
+            path.read_bytes(),
+            expected_subcarriers=config["room_a"]["expected_subcarriers"],
+            udp_port=config["room_a"]["udp_port"],
+            salvage_truncated=config["room_a"]["salvage_truncated"],
+            drop_consecutive_duplicates=quality["drop_consecutive_duplicates"],
+        )
+        # The dataset build stores decoded amplitudes with 4 decimals in the intermediate CSV.
+        amplitude = np.round(capture.amplitude.astype(np.float64), 4)
+    else:
+        values = pd.read_csv(path).apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float64)
+        if values.shape[1] != 256:
+            raise ValueError(f"{path.name}: expected 256 amplitude columns, got {values.shape[1]}")
+        values = values[np.isfinite(values).all(axis=1) & (values >= 0).all(axis=1)]
+        if quality["drop_consecutive_duplicates"]:
+            values = values[~consecutive_duplicate_mask(values)]
+        amplitude = values
+    return amplitude[classify_band_coverage(amplitude, quality) != "empty"].astype(np.float32)
+
+
+def windows_from_capture(path, config):
+    """Raw capture -> list of (window_id, (150, 256) window), with the dataset-build preprocessing."""
+    amplitude, length = capture_amplitude(path, config), config["window"]["length"]
+    return [(f"{Path(path).stem}_w{i}", amplitude[start:start + length])
+            for i, start in enumerate(window_starts(len(amplitude), config["window"]))]
+
+
+def padded_window(rows, length):
+    """One window from fewer than `length` observations of one capture: its own observations repeated in order."""
+    return np.resize(np.asarray(rows, dtype=np.float32), (length, rows.shape[1]))
+
+
+def windows_from_file(path, config):
+    """(window_id, window, note) for an episode file: a window (.npy) or a raw capture (.pcap/.csv).
+
+    A file with fewer than 150 valid observations gives one padded window; a .npy with more than
+    150 rows gives its centred 150. Raises ValueError for a file that is not 256-column CSI amplitude.
+    """
+    path, length = Path(path), config["window"]["length"]
+    if path.suffix.lower() == ".npy":
+        rows, window_id = np.asarray(np.load(path), dtype=np.float32), path.stem
+        if rows.ndim != 2 or rows.shape[1] != 256 or len(rows) == 0:
+            raise ValueError(f"expected a (150, 256) window, got shape {rows.shape}")
+        if len(rows) > length:
+            start = centered_tiling_starts(len(rows), length)[0]
+            return [(window_id, validate_window(rows[start:start + length], path.name), "")]
+        if len(rows) < length:
+            return [(window_id, validate_window(padded_window(rows, length), path.name), f"padded from {len(rows)}")]
+        return [(window_id, validate_window(rows, path.name), "")]
+    produced = [(window_id, validate_window(window, window_id), "") for window_id, window in
+                windows_from_capture(path, config)]
+    if produced:
+        return produced
+    rows = capture_amplitude(path, config)
+    if len(rows) == 0:
+        raise ValueError("no valid CSI observation")
+    return [(f"{path.stem}_w0", validate_window(padded_window(rows, length), path.stem),
+             f"padded from {len(rows)}")]
+
+
+def support_files(folder):
+    """Names of the files that support.csv uses as labelled examples (they are not inputs to label)."""
+    path = Path(folder) / "support.csv"
+    if not path.is_file():
+        return set()
+    table = pd.read_csv(path)
+    return {Path(str(name)).name.lower() for name in table.get("window_file", [])}
+
+
+def load_episode_inputs(folder, config):
+    """Collect every window of an episode folder: window files first, then raw captures.
+
+    Returns (window ids, windows (n, 150, 256), the input file of each window, with a padding note).
+    """
+    folder = Path(folder)
+    skip = RESERVED_FILES | support_files(folder)
+    inputs = sorted(p for p in folder.glob("*.npy") if p.name.lower() not in skip)
+    inputs += sorted(p for p in folder.iterdir()
+                     if p.suffix.lower() in (".pcap", ".csv") and p.name.lower() not in skip)
+    ids, windows, sources = [], [], []
+    for path in inputs:
+        try:
+            produced = windows_from_file(path, config)
+        except Exception as error:           # one unreadable file must not stop the whole episode
+            print(f"  note: skipped {path.name}: not a readable CSI window or capture ({error})")
+            continue
+        for window_id, window, note in produced:
+            if note:
+                print(f"  note: {path.name} has fewer than {config['window']['length']} valid observations; "
+                      f"{note} by repeating them")
+            ids.append(window_id)
+            windows.append(window)
+            sources.append(f"{path.name} ({note})" if note else path.name)
+    if not windows:
+        raise FileNotFoundError(f"No window_*.npy files or raw captures (.pcap/.csv) found in {folder}")
+    if len(set(ids)) != len(ids):
+        raise ValueError("Window ids must be unique within an episode")
+    return ids, np.stack(windows), sources
+
+
+# ------------------------------------------------------------------ the trained system
+
+def compute_features(bundle, X, representation):
+    inputs = prepare_input(X)
+    if representation == "handcrafted":
+        return window_features(inputs)
+    encoder = CSIEncoder(bundle["encoder"]["in_channels"])
+    encoder.load_state_dict(bundle["encoder"]["state_dict"])
+    return embed(encoder, inputs)
+
+
+def route(bundle, X):
+    """Task 1 router: (room per window, router confidence)."""
+    router = bundle["router"]
+    features = np.vstack([window_features(normalize(X[i:i + 400], router["norm"])) for i in range(0, len(X), 400)])
+    proba = router["model"].predict_proba(features)
+    return np.array(ROOMS)[proba.argmax(axis=1)], proba.max(axis=1)
+
+
+def fit_room_models(bundle, room, support_features, support_labels):
+    """Classifiers for windows routed to `room`, one per representation: shared activities from the other
+    room plus the support set, each balanced on the room's unlabelled development windows."""
+    settings = bundle["settings"]
+    r, other = bundle["rooms"][room], bundle["rooms"]["B" if room == "A" else "A"]
+    models = {}
+    for rep in r["representations"]:
+        model = make_head(settings["head"], settings["logreg_C"]).fit(
+            np.vstack([other["shared_features"][rep], support_features[rep]]),
+            np.concatenate([other["shared_labels"], support_labels]))
+        weights = None
+        if settings["balancing"] == "uniform":
+            weights = balancing_weights(model.predict_proba(r["dev_features"][rep]))
+        models[rep] = (model, weights)
+    return models
+
+
+def room_proba(models, features):
+    """Balanced class probabilities averaged over a room's models (`features`: representation -> aligned)."""
+    return np.mean([balanced_proba(model, features[rep], weights) for rep, (model, weights) in models.items()],
+                   axis=0)
+
+
+def calibrate(bundle, room, models, prior):
+    """The parts that depend on the room's classifiers: cluster means for smoothing and the sway reference."""
+    r = bundle["rooms"][room]
+    if not r["refinements"]:
+        return None, prior
+    P_dev = room_proba(models, r["dev_features"])
+    means = r["smoother"][0].cluster_means(P_dev) if "smoothing" in r["refinements"] else None
+    if prior is not None and "sway" in r["refinements"]:
+        classes = next(iter(models.values()))[0].classes_
+        prior = prior.with_sway(r["structure"]["dev_sway"], r["structure"]["dev_motion"],
+                                classes[P_dev.argmax(axis=1)], bundle["shared_labels"])
+    return means, prior
+
+
+def build_bundle(config, windows=None):
+    """Train the deployed system from the development data and the Task 1 / Task 2 outputs.
+
+    `windows` replaces the windows manifest; the leakage tests use it to hide labels.
+    """
+    started = time.time()
+    task3 = config["task3"]
+    settings = dict(config["final_model"], logreg_C=task3["logreg_C"], structure_segment=task3["structure_segment"],
+                    smoothing_clusters_per_class=task3["smoothing_clusters_per_class"],
+                    smoothing_components=task3["smoothing_components"])
+    quality = config["quality"]
+    paths = config["paths"]
+    if windows is None:
+        windows = pd.read_csv(paths["data_dir"] / "windows_manifest.csv")
+    X = np.load(paths["data_dir"] / "windows_X.npy", mmap_mode="r")
+    with open(paths["results_dir"] / "task1" / "room_router.pkl", "rb") as f:
+        router = pickle.load(f)
+    checkpoint = torch.load(paths["results_dir"] / "task2" / "encoder.pt", weights_only=False)
+    shared_labels = list(config["labels"]["shared"])
+    bundle = {
+        "settings": settings,
+        "router": router,
+        "encoder": {"state_dict": checkpoint["state_dict"], "in_channels": checkpoint["in_channels"]},
+        "label_sets": {room: shared_labels + list(task3["exclusive"][room]) for room in ROOMS},
+        "preprocessing_id": preprocessing_fingerprint(config),
+        "quality": quality,
+        "shared_labels": shared_labels,
+        "rooms": {},
+    }
+    # The structure prior and its refinements apply only to a room whose K-shot activities include the transitions.
+    with_prior = {room: settings["structure_prior"] == "transitions" and applicable(task3["exclusive"][room])
+                  for room in ROOMS}
+    refinements = {room: list(settings.get("refinements", [])) if with_prior[room] else [] for room in ROOMS}
+    representations = {room: list(ENSEMBLE) if "ensemble" in refinements[room] else [settings["representation"]]
+                       for room in ROOMS}
+    needed = {rep for reps in representations.values() for rep in reps}
+    if any("smoothing" in r for r in refinements.values()):
+        needed.add("ssl")
+
+    dev = (windows.split == "development").to_numpy()
+    dev_index = np.flatnonzero(dev)
+    X_dev = np.asarray(X[dev_index])
+    features = {}
+    for rep in sorted(needed):
+        values = compute_features(bundle, X_dev, rep)
+        features[rep] = np.zeros((len(windows), values.shape[1]), dtype=np.float32)
+        features[rep][dev_index] = values
+    del X_dev
+    labels = windows.label.to_numpy()
+    capture = windows.capture_id.to_numpy()
+
+    for room in ROOMS:
+        in_room = dev & (windows.room == room).to_numpy()
+        other = "B" if room == "A" else "A"
+        reference = in_room if settings["alignment"] == "per_room" else dev
+        stats = {rep: fit_stats(features[rep][reference]) for rep in needed}
+
+        def aligned(mask, reps):
+            return {rep: apply_stats(features[rep][mask], stats[rep]).astype(np.float32) for rep in reps}
+
+        shared = in_room & np.isin(labels, shared_labels)
+        support_ids = select_support(windows, room, task3["exclusive"][room], [settings["k"]],
+                                     config["few_shot"]["support_seed"], settings["support_draw"])[settings["k"]]
+        support = in_room & np.isin(capture, support_ids)
+        structure = None
+        if with_prior[room]:
+            dev_shapes, dev_motion, dev_sway = structure_features(X[np.flatnonzero(in_room)], quality)
+            sup_index = np.flatnonzero(support)
+            examples = posture_examples(X[sup_index], labels[sup_index], quality, settings["structure_segment"])
+            structure = {"prior": StructurePrior.fit(dev_shapes, dev_motion, examples[0], examples[1],
+                                                     C=settings["logreg_C"]),
+                         "examples": examples, "dev_motion": dev_motion, "dev_sway": dev_sway}
+        smoother = None
+        if "smoothing" in refinements[room]:
+            ssl_stats = fit_stats(features["ssl"][in_room])
+            n_clusters = settings["smoothing_clusters_per_class"] * len(bundle["label_sets"][room])
+            smoother = (ClusterSmoother(n_clusters, settings["smoothing_components"]).fit(
+                apply_stats(features["ssl"][in_room], ssl_stats)), ssl_stats)
+        bundle["rooms"][room] = {
+            "representations": representations[room],
+            "refinements": refinements[room],
+            "stats": {rep: stats[rep] for rep in representations[room]},
+            "dev_features": aligned(in_room, representations[room]),
+            "shared_features": aligned(shared, representations[other]),     # training data of the other room
+            "shared_labels": labels[shared],
+            "support_features": aligned(support, representations[room]),
+            "support_labels": labels[support],
+            "support_captures": list(support_ids),
+            "structure": structure,
+            "smoother": smoother,
+        }
+    for room in ROOMS:
+        r = bundle["rooms"][room]
+        r["models"] = fit_room_models(bundle, room, r["support_features"], r["support_labels"])
+        r["cluster_means"], r["prior"] = calibrate(bundle, room, r["models"],
+                                                   r["structure"]["prior"] if r["structure"] else None)
+    bundle["build_seconds"] = round(time.time() - started, 1)
+    return bundle
+
+
+def save_bundle(bundle, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump(bundle, f)
+
+
+def load_bundle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
+# ------------------------------------------------------------------ prediction
+
+def predict_windows(bundle, X, support=None):
+    """Predict room and activity for windows X (n, 150, 256).
+
+    `support` (optional) is a list of (window, label, room or None) from the episode.
+    Returns a DataFrame with room, room_confidence, label, confidence.
+    """
+    rooms, room_confidence = route(bundle, X)
+    needed = {rep for r in bundle["rooms"].values() for rep in r["representations"]}
+    if any(r["smoother"] for r in bundle["rooms"].values()):
+        needed.add("ssl")
+    features = {rep: compute_features(bundle, X, rep) for rep in sorted(needed)}
+    systems = {room: (r["models"], r["cluster_means"], r["prior"]) for room, r in bundle["rooms"].items()}
+
+    if support:
+        S = np.stack([validate_window(w, "support window") for w, _, _ in support])
+        s_labels = np.array([label for _, label, _ in support])
+        given = [room for _, _, room in support]
+        s_rooms = np.where([g in ROOMS for g in given], given, route(bundle, S)[0])
+        s_features = {rep: compute_features(bundle, S, rep) for rep in sorted(needed)}
+        for room in ROOMS:
+            mine = s_rooms == room
+            if not mine.any():
+                continue
+            unknown = set(s_labels[mine]) - set(bundle["label_sets"][room])
+            if unknown:
+                raise ValueError(f"Support labels {sorted(unknown)} are not activities of Room {room}")
+            r = bundle["rooms"][room]
+            keep = ~np.isin(r["support_labels"], s_labels[mine])      # default support for the other labels
+            new_features = {rep: np.vstack([r["support_features"][rep][keep],
+                                            apply_stats(s_features[rep][mine], r["stats"][rep])])
+                            for rep in r["representations"]}
+            new_labels = np.concatenate([r["support_labels"][keep], s_labels[mine]])
+            models = fit_room_models(bundle, room, new_features, new_labels)
+            prior = None
+            if r["structure"]:
+                shapes, ex_labels, sources = r["structure"]["examples"]
+                new = posture_examples(S[mine], s_labels[mine], bundle["quality"],
+                                       bundle["settings"]["structure_segment"])
+                kept = ~np.isin(sources, s_labels[mine])                    # default examples of other labels
+                all_labels = np.concatenate([ex_labels[kept], new[1]])
+                if {"SIT", "STAND"} <= set(all_labels):
+                    prior = r["structure"]["prior"].refit(np.vstack([shapes[kept], new[0]]), all_labels,
+                                                          bundle["settings"]["logreg_C"])
+            systems[room] = (models, *calibrate(bundle, room, models, prior))
+
+    label = np.empty(len(X), dtype=object)
+    confidence = np.zeros(len(X))
+    for room in ROOMS:
+        mine = rooms == room
+        if not mine.any():
+            continue
+        r = bundle["rooms"][room]
+        models, means, prior = systems[room]
+        P = room_proba(models, {rep: apply_stats(features[rep][mine], r["stats"][rep]) for rep in r["representations"]})
+        if means is not None:
+            smoother, stats = r["smoother"]
+            P = smoother.smooth(P, smoother.assign(apply_stats(features["ssl"][mine], stats)), means)
+        classes = next(iter(models.values()))[0].classes_
+        label[mine], confidence[mine] = classes[P.argmax(axis=1)], P.max(axis=1)
+        if prior is not None:
+            shapes, motion, sway = structure_features(X[mine], bundle["quality"])
+            label[mine], confidence[mine] = prior.revise(shapes, motion, label[mine], confidence[mine],
+                                                         bundle["shared_labels"], sway)
+    return pd.DataFrame({"room": rooms, "room_confidence": room_confidence.round(4),
+                         "label": label, "confidence": confidence.round(4)})
+
+
+def read_support(folder, config):
+    """support.csv -> list of (window, label, room or None); a raw capture contributes all its windows."""
+    folder = Path(folder)
+    table = pd.read_csv(folder / "support.csv")
+    missing = {"window_file", "label"} - set(table.columns)
+    if missing:
+        raise ValueError(f"support.csv is missing columns {sorted(missing)}")
+    support = []
+    for row in table.itertuples():
+        room = str(getattr(row, "room", "")).strip().upper()
+        for _, window, _ in windows_from_file(folder / str(row.window_file), config):
+            support.append((window, normalize_label(row.label), room if room in ROOMS else None))
+    return support
+
+
+def score_predictions(predictions, labels_file):
+    """Print accuracy and macro-F1 against an episode's labels.csv."""
+    truth = pd.read_csv(labels_file)
+    truth["window_id"] = truth.window_id.astype(str)
+    truth["label"] = truth.label.map(normalize_label)
+    if "room" in truth:
+        truth["room"] = truth.room.astype(str).str.strip().str.upper()
+    merged = predictions.merge(truth, on="window_id", suffixes=("", "_true"))
+    if merged.empty:
+        print("labels.csv has no window_id in common with the predictions")
+        return {}
+    scores = {
+        "windows scored": len(merged),
+        "activity accuracy": accuracy_score(merged.label_true, merged.label),
+        "activity balanced accuracy": balanced_accuracy_score(merged.label_true, merged.label),
+        "activity macro-F1": f1_score(merged.label_true, merged.label, average="macro", zero_division=0),
+    }
+    if "room_true" in merged:
+        scores["room accuracy"] = accuracy_score(merged.room_true.astype(str), merged.room)
+    for name, value in scores.items():
+        print(f"  {name:28s} {value if isinstance(value, int) else round(value, 4)}")
+    return scores

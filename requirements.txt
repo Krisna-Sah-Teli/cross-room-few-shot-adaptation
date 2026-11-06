@@ -1,0 +1,14 @@
+# Python 3.13. These are the exact versions that produced every result in App/results.
+# Install with:  pip install -r requirements.txt
+# All results were produced on CPU; the default PyTorch wheel is sufficient.
+numpy==2.2.6
+pandas==2.3.2
+scikit-learn==1.7.1
+scipy==1.16.1
+torch==2.10.0
+matplotlib==3.10.6
+PyYAML==6.0.3
+
+# Only needed to run the exploration notebook App/main_notebook.ipynb in VS Code / Jupyter.
+# (A full environment snapshot of the notebook machine is kept in requirements-notebook-freeze.txt.)
+ipykernel==7.1.0
